@@ -301,3 +301,46 @@ async fn partials_gradient_matches_finite_difference() {
         failed.join("\n  ")
     );
 }
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn depth_loss_masks_invalid_pixels_and_backprops() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // 2x2 grid:
+    // (0,0): valid gt=2.0, alpha=0.5, acc_depth=1.0 -> expected=2.0, err=0.0
+    // (0,1): valid gt=1.5, alpha=0.8, acc_depth=2.0 -> expected=2.5, err=1.0
+    // (1,0): invalid gt=0.0, alpha=0.9, acc_depth=9.0 -> masked out
+    // (1,1): low alpha=0.005, gt=3.0, acc_depth=0.5 -> masked out
+    let pred_depth =
+        Tensor::<1>::from_floats([1.0, 2.0, 9.0, 0.5], &device)
+            .reshape([2, 2])
+            .require_grad();
+    let pred_alpha =
+        Tensor::<1>::from_floats([0.5, 0.8, 0.9, 0.005], &device)
+            .reshape([2, 2])
+            .require_grad();
+    let gt_depth = Tensor::<1>::from_floats([2.0, 1.5, 0.0, 3.0], &device).reshape([2, 2]);
+
+    let loss = brush_loss::depth_loss(pred_depth.clone(), pred_alpha.clone(), gt_depth);
+    let loss_val = loss
+        .clone()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("readback");
+    // 2 valid pixels with errors 0.0 and 1.0 -> mean = 0.5
+    assert!(
+        (loss_val - 0.5).abs() < 1e-5,
+        "expected masked mean loss 0.5, got {loss_val}"
+    );
+
+    let grads = loss.backward();
+    let g_depth = to_vec(pred_depth.grad(&grads).expect("depth grad")).await;
+    let g_alpha = to_vec(pred_alpha.grad(&grads).expect("alpha grad")).await;
+
+    assert!(g_depth.iter().all(|v| v.is_finite()));
+    assert!(g_alpha.iter().all(|v| v.is_finite()));
+    // Only pixel (0, 1) has non-zero gradient: d/d(pred_depth) = +0.5 / 0.8 = 0.625.
+    assert!((g_depth[1] - 0.625).abs() < 1e-4, "g_depth[1]={}", g_depth[1]);
+    assert!(g_depth[2].abs() < 1e-6 && g_depth[3].abs() < 1e-6);
+    assert!(g_alpha[2].abs() < 1e-6 && g_alpha[3].abs() < 1e-6);
+}

@@ -451,6 +451,7 @@ pub async fn render_splats(
         render_mode,
         background,
         pass,
+        false,
     )
     .await;
 

@@ -101,6 +101,11 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
 
+    /// Weight of L1 depth loss when ground-truth depth maps are present in the dataset.
+    /// Set to 0 to disable depth supervision.
+    #[arg(long, help_heading = "Training options", default_value = "0.1")]
+    pub depth_loss_weight: f32,
+
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
 

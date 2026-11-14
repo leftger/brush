@@ -8,7 +8,8 @@ use super::{DatasetLoadResult, FormatError};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
-    formats::{find_image_by_name, find_mask_path, split_eval_every},
+    formats::{find_depth_path, find_image_by_name, find_mask_path, split_eval_every},
+    load_depth::LoadDepth,
     scene::{LoadImage, SceneView},
 };
 use brush_render::kernels::camera_model::CameraModel;
@@ -218,7 +219,14 @@ async fn load_dataset_inner(
                 load_args.invert_masks,
             );
 
-            views.push(SceneView { camera, image });
+            let depth = find_depth_path(&vfs, path)
+                .map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf(), None));
+
+            views.push(SceneView {
+                camera,
+                image,
+                depth,
+            });
         }
 
         let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);

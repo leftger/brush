@@ -19,7 +19,7 @@ use burn::{
         },
         tensor::{FloatTensor, IntTensor},
     },
-    tensor::{DType, Shape, Tensor},
+    tensor::{DType, Shape, Tensor, s},
 };
 use glam::Vec3;
 
@@ -40,21 +40,24 @@ pub(crate) struct SplatGrads<B: Backend> {
 /// ordinary argument whether its metadata expression reads it or not.
 mod bwd_ops {
     #![allow(unused_variables)]
-    use super::{ProjectUniforms, SplatGrads, SplatRenderMode, project_bwd_metadata};
+    use super::{
+        ProjectUniforms, SplatGrads, SplatRenderMode, project_bwd_metadata,
+        rasterize_bwd_metadata,
+    };
     use burn::backend::{
         Backend,
         tensor::{FloatTensor, IntTensor},
     };
-    use burn::tensor::Shape;
     use glam::Vec3;
 
     #[burn::backend::backend_extension(Fusion)]
     pub(crate) trait SplatBwdOps: Backend {
-        /// Returns sparse `v_combined` `[num_visible, 10]` indexed by
-        /// `compact_gid`: eight projected-splat gradients, then the raw opacity
-        /// gradient and the refinement weight.
+        /// Returns sparse `v_combined` `[num_visible, 10]` (or `11` when
+        /// `render_depth` is true) indexed by `compact_gid`: eight
+        /// projected-splat gradients, the raw opacity gradient, the
+        /// refinement weight, and optionally the depth gradient.
         #[allow(clippy::too_many_arguments)]
-        #[fusion(dtype = v_output, shape = Shape::new([projected_splats[0], 10]))]
+        #[fusion(meta = rasterize_bwd_metadata)]
         fn rasterize_bwd(
             out_img: FloatTensor<Self>,
             projected_splats: FloatTensor<Self>,
@@ -64,6 +67,7 @@ mod bwd_ops {
             img_size: glam::UVec2,
             v_output: FloatTensor<Self>,
             smooth_cutoff: bool,
+            render_depth: bool,
         ) -> FloatTensor<Self>;
 
         /// Writes a zero row, then one row per visible splat in `compact_gid`
@@ -82,13 +86,32 @@ mod bwd_ops {
             project_uniforms: ProjectUniforms,
             render_mode: SplatRenderMode,
             v_combined: FloatTensor<Self>,
+            render_depth: bool,
         ) -> SplatGrads<Self>;
     }
 }
 pub(crate) use bwd_ops::SplatBwdOps;
 
+/// Output shapes, which Fusion needs before `rasterize_bwd` runs.
+#[allow(clippy::too_many_arguments)]
+fn rasterize_bwd_metadata(
+    _out_img: &TensorSpec,
+    projected_splats: &TensorSpec,
+    _compact_gid_from_isect: &TensorSpec,
+    _tile_offsets: &TensorSpec,
+    _background: &Vec3,
+    _img_size: &glam::UVec2,
+    v_output: &TensorSpec,
+    _smooth_cutoff: &bool,
+    render_depth: &bool,
+) -> TensorSpec {
+    let lanes = if *render_depth { 11 } else { 10 };
+    TensorSpec::new(Shape::new([projected_splats.shape[0], lanes]), v_output.dtype)
+}
+
 /// Output shapes, which Fusion needs before the kernel runs. The visible count
 /// and SH degree are already host values, so none of this waits on a readback.
+#[allow(clippy::too_many_arguments)]
 fn project_bwd_metadata(
     _transforms: &TensorSpec,
     _sh_coeffs: &TensorSpec,
@@ -99,6 +122,7 @@ fn project_bwd_metadata(
     project_uniforms: &ProjectUniforms,
     _render_mode: &SplatRenderMode,
     _v_combined: &TensorSpec,
+    _render_depth: &bool,
 ) -> SplatGradsMetadata {
     let rows = project_uniforms.num_visible as usize + 1;
     let coeffs = sh_coeffs_for_degree(project_uniforms.sh_degree) as usize;
@@ -133,6 +157,7 @@ struct GaussianBackwardState<B: Backend> {
     pass: crate::gaussian_splats::RasterPass,
     background: Vec3,
     img_size: glam::UVec2,
+    render_depth: bool,
 }
 
 #[derive(Debug)]
@@ -174,6 +199,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.img_size,
             v_output,
             state.pass.smooth_cutoff(),
+            state.render_depth,
         );
 
         let splat_grads = B::project_bwd(
@@ -186,6 +212,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.project_uniforms,
             state.render_mode,
             v_combined,
+            state.render_depth,
         );
 
         // The kernels write compact gradients with a zero row in front, and
@@ -230,8 +257,11 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
 }
 
 pub struct SplatOutputDiff {
-    /// Rendered image, on the autodiff graph (this is what the loss backprops through).
+    /// Rendered image `[H, W, 4]`, on the autodiff graph (this is what the loss backprops through).
     pub img: Tensor<3>,
+    /// Accumulated splat depth `[H, W]` (`sum(T_i * alpha_i * d_i)`), present when
+    /// `render_depth` is true. Divide by `alpha` (channel 3 of `img`) to obtain expected depth.
+    pub depth: Option<Tensor<2>>,
     pub num_visible: u32,
     /// Per-splat visibility aux — on the **inner** backend (no gradients).
     pub visible: Tensor<1>,
@@ -258,12 +288,33 @@ pub async fn render_splats(
     img_size: glam::UVec2,
     background: Vec3,
 ) -> SplatOutputDiff {
-    render_splats_with_pass(
+    render_splats_with_pass_and_depth(
         splats,
         camera,
         img_size,
         background,
         crate::gaussian_splats::RasterPass::Backward,
+        false,
+    )
+    .await
+}
+
+/// Like [`render_splats`], optionally also rendering accumulated differentiable
+/// depth (`SplatOutputDiff::depth`).
+pub async fn render_splats_with_depth(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    render_depth: bool,
+) -> SplatOutputDiff {
+    render_splats_with_pass_and_depth(
+        splats,
+        camera,
+        img_size,
+        background,
+        crate::gaussian_splats::RasterPass::Backward,
+        render_depth,
     )
     .await
 }
@@ -277,6 +328,19 @@ pub async fn render_splats_with_pass(
     img_size: glam::UVec2,
     background: Vec3,
     pass: crate::gaussian_splats::RasterPass,
+) -> SplatOutputDiff {
+    render_splats_with_pass_and_depth(splats, camera, img_size, background, pass, false).await
+}
+
+/// Differentiable render with explicit [`crate::gaussian_splats::RasterPass`]
+/// and optional depth output.
+pub async fn render_splats_with_pass_and_depth(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: crate::gaussian_splats::RasterPass,
+    render_depth: bool,
 ) -> SplatOutputDiff {
     splats.clone().validate_values().await;
 
@@ -319,11 +383,23 @@ pub async fn render_splats_with_pass(
         render_mode,
         background,
         pass,
+        render_depth,
     )
     .await;
 
+    let out_tensor: Tensor<3> = Tensor::from_dispatch(output.out_img);
+    let (img, depth) = if render_depth {
+        (
+            out_tensor.clone().slice(s![.., .., 0..4]),
+            Some(out_tensor.slice(s![.., .., 4..5]).squeeze_dim::<2>(2)),
+        )
+    } else {
+        (out_tensor, None)
+    };
+
     SplatOutputDiff {
-        img: Tensor::from_dispatch(output.out_img),
+        img,
+        depth,
         num_visible: output.aux.num_visible,
         visible: Tensor::from_dispatch(output.aux.visible).without_autodiff(),
         max_radius: Tensor::from_dispatch(output.aux.max_radius).without_autodiff(),
@@ -349,6 +425,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
+        render_depth: bool,
     ) -> crate::RenderOutput<Self> {
         let prep_nodes = RenderBackwards
             .prepare::<NoCheckpointing>([
@@ -380,6 +457,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
             render_mode,
             background,
             pass,
+            render_depth,
         )
         .await;
 
@@ -404,6 +482,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
                     compact_from_global: output.compact_from_global.clone(),
                     background,
                     img_size,
+                    render_depth,
                 };
                 prep.finish(state, output.out_img)
             }

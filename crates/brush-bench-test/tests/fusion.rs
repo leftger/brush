@@ -76,6 +76,7 @@ fn test_batch(width: u32, height: u32) -> SceneBatch {
             glam::vec2(0.5, 0.5),
             Pinhole,
         ),
+        depth: None,
     }
 }
 

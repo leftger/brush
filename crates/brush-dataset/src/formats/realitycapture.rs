@@ -1,10 +1,11 @@
 use super::{
-    DatasetLoadResult, FormatError, find_image_by_name, find_mask_path, opengl_c2w_to_pose,
-    split_eval_every,
+    DatasetLoadResult, FormatError, find_depth_path, find_image_by_name, find_mask_path,
+    opengl_c2w_to_pose, split_eval_every,
 };
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
+    load_depth::LoadDepth,
     scene::{LoadImage, SceneView},
 };
 use brush_render::camera::{Camera, focal_to_fov};
@@ -128,6 +129,8 @@ async fn read_dataset_inner(
         };
 
         let mask_path = find_mask_path(&vfs, &image_path).map(Path::to_path_buf);
+        let depth = find_depth_path(&vfs, &image_path)
+            .map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf(), None));
         let image = LoadImage::new(
             vfs.clone(),
             image_path,
@@ -150,7 +153,11 @@ async fn read_dataset_inner(
             continue;
         }
 
-        views.push(SceneView { camera, image });
+        views.push(SceneView {
+            camera,
+            image,
+            depth,
+        });
     }
 
     let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);

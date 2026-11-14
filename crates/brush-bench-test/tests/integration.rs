@@ -127,6 +127,7 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
         camera,
+        depth: None,
     }
 }
 
@@ -253,6 +254,7 @@ async fn train_with_zero_visible_does_not_crash() {
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
         camera,
+        depth: None,
     };
 
     let config = TrainConfig::default();
@@ -483,4 +485,41 @@ async fn growth_waits_for_start_iter() {
     }
     let (_, after) = trainer.refine(2500, splats).await;
     assert_eq!(after.num_split_high_grad, 0);
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn train_step_with_depth_supervision_is_finite() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let mut batch = generate_test_batch((64, 64));
+    let mut depth_vals = vec![2.5f32; 64 * 64];
+    for (i, v) in depth_vals.iter_mut().enumerate() {
+        if i % 5 == 0 {
+            *v = 0.0;
+        }
+    }
+    batch.depth = Some(TensorData::new(depth_vals, [64, 64]));
+
+    let config = TrainConfig {
+        depth_loss_weight: 0.25,
+        ..TrainConfig::default()
+    };
+    let mut trainer = SplatTrainer::new(
+        &config,
+        &device,
+        BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+    );
+    let mut splats = generate_test_splats(&device, 100).valid();
+    for iter in 0..5 {
+        let (new_splats, stats) = trainer.step(batch.clone(), splats.train()).await;
+        let loss_scalar = stats
+            .loss
+            .into_scalar_async::<f32>()
+            .await
+            .expect("loss readback");
+        assert!(loss_scalar.is_finite(), "non-finite loss at iter {iter}");
+        let (refined, _) = trainer.refine(iter, new_splats.valid()).await;
+        splats = refined;
+    }
+    assert!(all_finite(&splats).await);
 }

@@ -147,12 +147,23 @@ async fn run_loader(
                 .load()
                 .await
                 .expect("Scene loader failed to load an image");
+            let (img_w, img_h) = (raw.width(), raw.height());
             let (img_packed, has_alpha) = view_to_packed_data(raw, view.image.alpha_mode());
+            let depth = if let Some(depth_loader) = &view.depth {
+                let d = depth_loader
+                    .load((img_w, img_h))
+                    .await
+                    .expect("Scene loader failed to load a depth map");
+                Some(TensorData::new(d, [img_h as usize, img_w as usize]))
+            } else {
+                None
+            };
             let mut batch = SceneBatch {
                 img_packed,
                 has_alpha,
                 alpha_mode: view.image.alpha_mode(),
                 camera: view.camera,
+                depth,
             };
 
             let mut cache = cache.lock().await;
@@ -160,6 +171,7 @@ async fn run_loader(
                 // Share the pixels before caching: this hand-off and every
                 // later hit then costs a refcount instead of a full copy.
                 batch.img_packed = share_packed(batch.img_packed);
+                batch.depth = batch.depth.map(share_packed);
                 cache.insert(index, Arc::new(batch.clone()));
             }
             batch

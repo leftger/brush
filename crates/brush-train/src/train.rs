@@ -10,8 +10,8 @@ use crate::{
     stats::RefineRecord,
 };
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, image_loss};
-use brush_render::bwd::render_splats;
+use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_render::bwd::render_splats_with_depth;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use burn::{
@@ -268,11 +268,19 @@ impl SplatTrainer {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
-                .instrument(trace_span!("Forward"))
-                .await;
+            let render_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
+            let diff_out = render_splats_with_depth(
+                render_input,
+                &camera,
+                img_size,
+                background,
+                render_depth,
+            )
+            .instrument(trace_span!("Forward"))
+            .await;
 
             let pred_image = diff_out.img;
+            let pred_depth = diff_out.depth;
             let refine_weight_holder = diff_out.refine_weight_holder;
             let visible = diff_out.visible;
             let max_radius = diff_out.max_radius;
@@ -323,6 +331,16 @@ impl SplatTrainer {
                         pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
+            }
+
+            if let (Some(pred_depth), Some(gt_depth_data)) = (pred_depth, batch.depth)
+                && self.config.depth_loss_weight > 0.0
+            {
+                let gt_depth: Tensor<2> = Tensor::from_data(gt_depth_data, &device.clone().inner());
+                let pred_alpha = pred_image.clone().slice(s![.., .., 3..4]).squeeze_dim::<2>(2);
+                loss = loss
+                    + depth_loss(pred_depth, pred_alpha, Tensor::from_inner(gt_depth))
+                        * self.config.depth_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the

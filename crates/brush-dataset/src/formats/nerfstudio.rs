@@ -1,7 +1,8 @@
-use super::{DatasetLoadResult, FormatError, find_mask_path, opengl_c2w_to_pose};
+use super::{DatasetLoadResult, FormatError, find_depth_path, find_mask_path, opengl_c2w_to_pose};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
+    load_depth::LoadDepth,
     scene::{LoadImage, SceneView},
 };
 use brush_render::camera::fov_to_focal;
@@ -34,6 +35,8 @@ struct JsonScene {
     camera_model: Option<String>,
     // Nerfstudio doesn't mention this in their format? But fine to include really.
     ply_file_path: Option<String>,
+    /// Multiplier converting depth image values to metres.
+    depth_unit_scale_factor: Option<f64>,
 
     /// Principal point x
     cx: Option<f64>,
@@ -99,6 +102,8 @@ struct FrameData {
 
     transform_matrix: Vec<Vec<f32>>,
     file_path: String,
+    depth_file_path: Option<String>,
+    depth_unit_scale_factor: Option<f64>,
 }
 
 /// Build a `CameraModel` from a nerfstudio `camera_model` string and the
@@ -187,7 +192,7 @@ async fn read_transforms_file(
         let mask_path = find_mask_path(&vfs, &path).map(|p| p.to_path_buf());
         let image = LoadImage::new(
             vfs.clone(),
-            path,
+            path.clone(),
             mask_path,
             load_args.max_resolution,
             load_args.alpha_mode,
@@ -262,7 +267,34 @@ async fn read_transforms_file(
             continue;
         }
 
-        let view = SceneView { image, camera };
+        let depth_scale = frame
+            .depth_unit_scale_factor
+            .or(scene.depth_unit_scale_factor)
+            .map(|v| v as f32);
+        let depth_path = if let Some(depth_rel) = &frame.depth_file_path {
+            let p = transforms_path
+                .parent()
+                .expect("Transforms path must be a filename")
+                .join(depth_rel);
+            if vfs.reader_at_path(&p).await.is_ok() {
+                Some(p)
+            } else {
+                warnings.push(format!(
+                    "Depth file '{}' for '{}' not found; ignoring depth for this frame",
+                    depth_rel, frame.file_path
+                ));
+                None
+            }
+        } else {
+            find_depth_path(&vfs, &path).map(|p| p.to_path_buf())
+        };
+        let depth = depth_path.map(|p| LoadDepth::new(vfs.clone(), p, depth_scale));
+
+        let view = SceneView {
+            image,
+            depth,
+            camera,
+        };
         results.push(view);
     }
     Ok(results)
@@ -456,7 +488,67 @@ mod tests {
         let views = &result.dataset.train.views;
         assert_eq!(views.len(), 1, "warnings: {:?}", result.warnings);
         assert!(views[0].image.path().ends_with(Path::new("train/r_0.png")));
+        assert!(views[0].depth.is_none());
         assert_eq!(result.warnings.len(), 1);
         assert!(result.warnings[0].contains("r_1"));
+    }
+
+    #[tokio::test]
+    async fn loads_depth_file_path_and_unit_scale_factor() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let json = r#"{
+            "fl_x": 40.0,
+            "fl_y": 40.0,
+            "cx": 2.0,
+            "cy": 1.0,
+            "w": 4,
+            "h": 2,
+            "depth_unit_scale_factor": 0.002,
+            "frames": [
+                {
+                    "file_path": "images/00000.png",
+                    "depth_file_path": "depth/00000.png",
+                    "transform_matrix": [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0]
+                    ]
+                }
+            ]
+        }"#;
+        tokio::fs::write(dir.join("transforms.json"), json)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.join("images")).await.unwrap();
+        tokio::fs::create_dir_all(dir.join("depth")).await.unwrap();
+        image::RgbImage::from_pixel(4, 2, image::Rgb([10, 20, 30]))
+            .save(dir.join("images/00000.png"))
+            .unwrap();
+        let depth_img: image::ImageBuffer<image::Luma<u16>, Vec<u16>> =
+            image::ImageBuffer::from_raw(4, 2, vec![1000; 8]).unwrap();
+        depth_img.save(dir.join("depth/00000.png")).unwrap();
+
+        let vfs = Arc::new(BrushVfs::from_path(dir).await.unwrap());
+        let config = LoadDatasetConfig {
+            max_frames: None,
+            max_resolution: 1920,
+            eval_split_every: None,
+            subsample_frames: None,
+            subsample_points: None,
+            alpha_mode: None,
+            invert_masks: false,
+            units_per_meter: 1.0,
+            max_scene_batch_cache_size: 0,
+        };
+        let result = read_dataset(vfs, &config)
+            .await
+            .expect("transforms.json")
+            .expect("load");
+        let view = &result.dataset.train.views[0];
+        let depth_loader = view.depth.as_ref().expect("depth loader");
+        let depths = depth_loader.load((4, 2)).await.unwrap();
+        assert_eq!(depths, vec![2.0; 8]);
     }
 }

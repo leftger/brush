@@ -1502,6 +1502,104 @@ async fn finite_diff_means_through_high_sh_documents_bug() {
     );
 }
 
+/// Finite-difference check for joint RGB + depth rendering backward kernels
+/// (`rasterize_backwards` depth term + `project_backwards` `v_mean_c.z`).
+#[tokio::test]
+async fn finite_difference_depth_gradients() {
+    use brush_render::bwd::render_splats_with_pass_and_depth;
+
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let cam = std_cam();
+    let img_size = glam::uvec2(32, 32);
+    let scene = base_scene();
+    let eps = 1e-3_f32;
+    let rel_tol = 0.015_f32;
+    let abs_tol = 1e-4_f32;
+
+    let depth_and_rgb_loss = |s: &Scene| {
+        let cam = &cam;
+        let device = &device;
+        let s = s.clone();
+        async move {
+            let splats = build_splats(&s, device);
+            let diff = render_splats_with_pass_and_depth(
+                splats,
+                cam,
+                img_size,
+                Vec3::ZERO,
+                PASS,
+                true,
+            )
+            .await;
+            let depth = diff.depth.expect("depth tensor");
+            (diff.img.mean() + depth.mean())
+                .into_scalar_async::<f32>()
+                .await
+                .expect("loss readback")
+        }
+    };
+
+    let splats = build_splats(&scene, &device);
+    let diff = render_splats_with_pass_and_depth(
+        splats.clone(),
+        &cam,
+        img_size,
+        Vec3::ZERO,
+        PASS,
+        true,
+    )
+    .await;
+    let depth = diff.depth.expect("depth tensor");
+    let grads = (diff.img.mean() + depth.mean()).backward();
+
+    let cases: &[(Lane, usize, usize)] = &[
+        (Lane::Mean, 0, 0),
+        (Lane::Mean, 0, 1),
+        (Lane::Mean, 0, 2),
+        (Lane::Mean, 1, 2),
+        (Lane::Rot, 0, 0),
+        (Lane::Rot, 1, 2),
+        (Lane::LogScale, 0, 0),
+        (Lane::LogScale, 1, 1),
+        (Lane::ShDc, 0, 0),
+        (Lane::RawOpac, 0, 0),
+        (Lane::RawOpac, 1, 0),
+    ];
+
+    let mut failed = Vec::new();
+    for &(lane, splat, comp) in cases {
+        let mut s_plus = scene.clone();
+        perturb(&mut s_plus, lane, splat, comp, eps);
+        let l_plus = depth_and_rgb_loss(&s_plus).await;
+
+        let mut s_minus = scene.clone();
+        perturb(&mut s_minus, lane, splat, comp, -eps);
+        let l_minus = depth_and_rgb_loss(&s_minus).await;
+
+        let numerical = (l_plus - l_minus) / (2.0 * eps);
+        let an = analytical_at(&splats, &grads, lane, splat, comp).await;
+
+        let abs_err = (numerical - an).abs();
+        let scale = numerical.abs().max(an.abs()).max(1e-8);
+        let tol = abs_tol + rel_tol * scale;
+        if abs_err > tol {
+            failed.push(format!(
+                "{}[{},{}]: numerical {numerical:.6} vs analytical {an:.6} \
+                 (|Δ|={abs_err:.3e} > tol {tol:.3e})",
+                lane_name(lane),
+                splat,
+                comp,
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "depth finite-diff vs analytical mismatch:\n  {}",
+        failed.join("\n  "),
+    );
+}
+
 /// **Kitchen sink**: every axis randomized at once (rotated camera +
 /// off-center principal + asymmetric focal + non-square image + KB4 or
 /// RT8 + anisotropic scales + mid-range depths). If any pairwise

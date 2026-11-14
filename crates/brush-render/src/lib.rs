@@ -83,6 +83,7 @@ pub trait SplatOps: Backend {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: gaussian_splats::RasterPass,
+        render_depth: bool,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }
 

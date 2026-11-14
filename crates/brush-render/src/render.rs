@@ -50,12 +50,17 @@ impl SplatOps for CubeBackend {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: RasterPass,
+        render_depth: bool,
     ) -> RenderOutput<Self> {
         assert!(
             img_size[0] > 0 && img_size[1] > 0,
             "Can't render images with 0 size."
         );
         let bwd_info = pass.bwd_info();
+        assert!(
+            !render_depth || bwd_info,
+            "render_depth requires Backward pass."
+        );
         let smooth_cutoff = pass.smooth_cutoff();
 
         let transforms = into_contiguous(transforms);
@@ -277,7 +282,11 @@ impl SplatOps for CubeBackend {
                 tile_offsets.clone().into_tensor_arg(),
             );
         });
-        let out_dim = if bwd_info { 4 } else { 1 };
+        let out_dim = if bwd_info {
+            if render_depth { 5 } else { 4 }
+        } else {
+            1
+        };
         let out_img = create_tensor(
             [img_size.y as usize, img_size.x as usize, out_dim],
             &device,
@@ -329,6 +338,7 @@ impl SplatOps for CubeBackend {
                 project_uniforms.tile_bounds[0],
                 bwd_info,
                 smooth_cutoff,
+                render_depth,
             );
         });
         RenderOutput {

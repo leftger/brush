@@ -1272,3 +1272,21 @@ pub fn unpack_gt_rgb(gt_packed: Tensor<2, Int>, composite_bg: Option<Vec3>) -> T
     );
     Tensor::from_dispatch(out)
 }
+
+/// Masked L1 loss between expected splat depth (`pred_depth / pred_alpha`) and
+/// ground-truth metric depth (`[H, W]`, `<= 0` treated as missing).
+///
+/// Pixels with `gt_depth <= 0` or `pred_alpha <= 1e-2` are excluded from both
+/// the numerator and denominator so unpopulated background or low-opacity edge
+/// pixels do not amplify `1 / alpha` gradients.
+pub fn depth_loss(pred_depth: Tensor<2>, pred_alpha: Tensor<2>, gt_depth: Tensor<2>) -> Tensor<1> {
+    const MIN_ALPHA: f32 = 1e-2;
+    let valid = gt_depth
+        .clone()
+        .greater_elem(0.0)
+        .bool_and(pred_alpha.clone().greater_elem(MIN_ALPHA))
+        .float();
+    let count = valid.clone().sum().clamp_min(1.0);
+    let expected = pred_depth / pred_alpha.clamp_min(MIN_ALPHA);
+    ((expected - gt_depth).abs() * valid).sum() / count
+}

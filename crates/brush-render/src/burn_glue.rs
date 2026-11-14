@@ -91,6 +91,7 @@ impl SplatOps for Fusion<CubeBackend> {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
+        render_depth: bool,
     ) -> RenderOutput<Self> {
         let client = transforms.client.clone();
 
@@ -129,6 +130,7 @@ impl SplatOps for Fusion<CubeBackend> {
             render_mode,
             background,
             pass,
+            render_depth,
         )
         .await;
 

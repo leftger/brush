@@ -4,6 +4,7 @@ use glam::{Affine3A, Vec3, vec3};
 use image::DynamicImage;
 use std::sync::Arc;
 
+pub use crate::load_depth::LoadDepth;
 pub use crate::load_image::LoadImage;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -16,6 +17,7 @@ pub enum ViewType {
 #[derive(Clone)]
 pub struct SceneView {
     pub image: LoadImage,
+    pub depth: Option<LoadDepth>,
     pub camera: Camera,
 }
 
@@ -63,6 +65,7 @@ impl Scene {
             .into_iter()
             .map(|v| SceneView {
                 image: v.image.with_scale(scale),
+                depth: v.depth,
                 camera: v.camera,
             })
             .collect();
@@ -144,16 +147,25 @@ pub struct SceneBatch {
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
     pub camera: Camera,
+    /// Optional `[H, W]` f32 ground-truth depth in scene units (metres).
+    /// Non-positive values indicate missing/invalid depth pixels.
+    pub depth: Option<TensorData>,
 }
 
 impl SceneBatch {
-    /// Host bytes the packed image occupies.
+    /// Host bytes the packed image (and optional depth map) occupy.
     pub fn packed_bytes(&self) -> u64 {
-        self.img_packed
+        let img_bytes: u64 = self
+            .img_packed
             .as_bytes()
             .len()
             .try_into()
-            .expect("shouldn't exceed ~18 Exabytes...")
+            .expect("shouldn't exceed ~18 Exabytes...");
+        let depth_bytes: u64 = self
+            .depth
+            .as_ref()
+            .map_or(0, |d| d.as_bytes().len() as u64);
+        img_bytes + depth_bytes
     }
 
     pub fn img_size(&self) -> [usize; 2] {

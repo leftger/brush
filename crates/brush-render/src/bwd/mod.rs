@@ -8,4 +8,7 @@ pub mod burn_glue;
 mod kernels;
 mod render_bwd;
 
-pub use burn_glue::{SplatOutputDiff, render_splats, render_splats_with_pass};
+pub use burn_glue::{
+    SplatOutputDiff, render_splats, render_splats_with_depth, render_splats_with_pass,
+    render_splats_with_pass_and_depth,
+};

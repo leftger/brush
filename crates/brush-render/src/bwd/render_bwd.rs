@@ -29,6 +29,7 @@ impl SplatBwdOps for CubeBackend {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        render_depth: bool,
     ) -> FloatTensor<Self> {
         let _span = tracing::trace_span!("rasterize_bwd").entered();
 
@@ -37,8 +38,9 @@ impl SplatBwdOps for CubeBackend {
         let num_visible = projected_splats.shape()[0];
         let client = projected_splats.client.clone();
 
-        // Sparse [num_visible, 10] indexed by compact_gid.
-        let v_combined = Self::float_zeros([num_visible, 10].into(), &device, FloatDType::F32);
+        // Sparse [num_visible, 10] (or 11 when render_depth) indexed by compact_gid.
+        let lanes = if render_depth { 11 } else { 10 };
+        let v_combined = Self::float_zeros([num_visible, lanes].into(), &device, FloatDType::F32);
 
         let tile_bounds = uvec2(
             img_size.x.div_ceil(crate::shaders::helpers::TILE_WIDTH),
@@ -78,6 +80,7 @@ impl SplatBwdOps for CubeBackend {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    render_depth,
                 );
             } else {
                 rasterize_backwards_kernel::launch::<CasAtomicAdd>(
@@ -92,6 +95,7 @@ impl SplatBwdOps for CubeBackend {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    render_depth,
                 );
             }
         });
@@ -110,6 +114,7 @@ impl SplatBwdOps for CubeBackend {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
+        render_depth: bool,
     ) -> SplatGrads<Self> {
         let _span = tracing::trace_span!("project_bwd").entered();
 
@@ -157,6 +162,7 @@ impl SplatBwdOps for CubeBackend {
                 has_min_scale,
                 project_uniforms.sh_degree,
                 project_uniforms.camera_model,
+                render_depth,
             );
         });
 
