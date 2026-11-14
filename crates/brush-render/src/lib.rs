@@ -80,10 +80,12 @@ pub trait SplatOps: Backend {
         log_scale_offset: f32,
         refine_weight: FloatTensor<Self>,
         coeffs_grad_sq: FloatTensor<Self>,
+        cam_pose_grad: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: gaussian_splats::RasterPass,
         render_depth: bool,
+        render_cam_grads: bool,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }
 

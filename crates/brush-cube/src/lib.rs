@@ -95,6 +95,14 @@ impl Vec3A {
         self.scale(1.0f32 / self.length())
     }
 
+    pub fn cross(self, other: Vec3A) -> Vec3A {
+        Vec3A::new(
+            self.y() * other.z() - self.z() * other.y(),
+            self.z() * other.x() - self.x() * other.z(),
+            self.x() * other.y() - self.y() * other.x(),
+        )
+    }
+
     pub fn is_finite(self) -> bool {
         is_finite_f32(self.x()) && is_finite_f32(self.y()) && is_finite_f32(self.z())
     }

@@ -150,6 +150,8 @@ pub struct SceneBatch {
     /// Optional `[H, W]` f32 ground-truth depth in scene units (metres).
     /// Non-positive values indicate missing/invalid depth pixels.
     pub depth: Option<TensorData>,
+    /// Index of this view within the loaded scene.
+    pub view_index: usize,
 }
 
 impl SceneBatch {

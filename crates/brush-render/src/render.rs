@@ -47,10 +47,12 @@ impl SplatOps for CubeBackend {
         log_scale_offset: f32,
         _refine_weight: FloatTensor<Self>,
         _coeffs_grad_sq: FloatTensor<Self>,
+        _cam_pose_grad: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: RasterPass,
         render_depth: bool,
+        _render_cam_grads: bool,
     ) -> RenderOutput<Self> {
         assert!(
             img_size[0] > 0 && img_size[1] > 0,

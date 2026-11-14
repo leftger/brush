@@ -128,6 +128,7 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
         alpha_mode: AlphaMode::Transparent,
         camera,
         depth: None,
+        view_index: 0,
     }
 }
 
@@ -255,6 +256,7 @@ async fn train_with_zero_visible_does_not_crash() {
         alpha_mode: AlphaMode::Transparent,
         camera,
         depth: None,
+        view_index: 0,
     };
 
     let config = TrainConfig::default();
@@ -522,4 +524,144 @@ async fn train_step_with_depth_supervision_is_finite() {
         splats = refined;
     }
     assert!(all_finite(&splats).await);
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn pose_refinement_recovers_perturbed_camera_pose() {
+    use brush_render::bwd::render_splats_with_options;
+    use brush_render::gaussian_splats::RasterPass;
+
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let mut splats = generate_test_splats(&device, 128).valid();
+    // Make splats visible and high-contrast at z ~ 0 inside the frustum.
+    let true_cam = Camera::new(
+        Vec3::new(0.0, 0.0, 3.0),
+        Quat::IDENTITY,
+        0.8,
+        0.8,
+        glam::vec2(0.5, 0.5),
+        Pinhole,
+    );
+    let gt_out = render_splats_with_options(
+        splats.clone().train(),
+        &true_cam,
+        glam::uvec2(64, 64),
+        Vec3::ZERO,
+        RasterPass::Backward,
+        true,
+        false,
+    )
+    .await;
+    assert!(gt_out.num_visible > 0);
+
+    let gt_floats: Vec<f32> = gt_out
+        .img
+        .inner()
+        .into_data_async()
+        .await
+        .expect("gt render readback")
+        .try_into_vec()
+        .expect("f32 gt image");
+    let gt_alpha: Vec<f32> = gt_floats.chunks_exact(4).map(|px| px[3]).collect();
+    let gt_depth_raw: Vec<f32> = gt_out
+        .depth
+        .expect("gt depth")
+        .inner()
+        .into_data_async()
+        .await
+        .expect("gt depth readback")
+        .try_into_vec()
+        .expect("f32 gt depth");
+    // Ground-truth metric depth is expected_depth = pred_depth / pred_alpha.
+    let gt_depth: Vec<f32> = gt_depth_raw
+        .into_iter()
+        .zip(gt_alpha.into_iter())
+        .map(|(d, a)| if a > 0.05 { (d / a).max(0.0) } else { 0.0 })
+        .collect();
+    let packed: Vec<i32> = gt_floats
+        .chunks_exact(4)
+        .map(|px| {
+            let r = (px[0].clamp(0.0, 1.0) * 255.0).round() as u32;
+            let g = (px[1].clamp(0.0, 1.0) * 255.0).round() as u32;
+            let b = (px[2].clamp(0.0, 1.0) * 255.0).round() as u32;
+            (r | (g << 8) | (b << 16) | (255 << 24)) as i32
+        })
+        .collect();
+
+    let perturbed_cam = Camera::new(
+        true_cam.position + Vec3::new(0.06, -0.04, 0.06),
+        (Quat::from_rotation_z(0.05) * true_cam.rotation).normalize(),
+        0.8,
+        0.8,
+        glam::vec2(0.5, 0.5),
+        Pinhole,
+    );
+    let batch = SceneBatch {
+        img_packed: TensorData::new(packed, [64usize, 64]),
+        has_alpha: false,
+        alpha_mode: AlphaMode::Transparent,
+        camera: perturbed_cam,
+        depth: Some(TensorData::new(gt_depth, [64usize, 64])),
+        view_index: 7,
+    };
+
+    // Freeze splats (all splat LRs = 0) so only per-view SE(3) pose refinement optimizes.
+    let config = TrainConfig {
+        lr_mean: 0.0,
+        lr_mean_end: 0.0,
+        lr_rotation: 0.0,
+        lr_scale: 0.0,
+        lr_coeffs_dc: 0.0,
+        lr_opac: 0.0,
+        opac_entropy_weight: 0.0,
+        mean_noise_weight: 0.0,
+        background_noise_strength: 0.0,
+        depth_loss_weight: 0.25,
+        lr_pose: 5e-3,
+        total_train_iters: 150,
+        ..TrainConfig::default()
+    };
+    let mut trainer = SplatTrainer::new(
+        &config,
+        &device,
+        BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
+    );
+
+    let mut first_loss = None;
+    let mut last_loss = 0.0f32;
+    for _ in 0..90 {
+        let (new_splats, stats) = trainer.step(batch.clone(), splats.train()).await;
+        let l = stats
+            .loss
+            .into_scalar_async::<f32>()
+            .await
+            .expect("loss readback");
+        if first_loss.is_none() {
+            first_loss = Some(l);
+        }
+        last_loss = l;
+        splats = new_splats.valid();
+    }
+
+    let first_loss = first_loss.unwrap();
+    assert!(
+        last_loss < first_loss * 0.5,
+        "pose refinement did not strongly reduce photometric loss: {first_loss:.5} -> {last_loss:.5}"
+    );
+    let (dp, dq) = trainer
+        .view_pose_delta(7)
+        .expect("pose delta should be recorded for view 7");
+    let init_pos_err = (perturbed_cam.position - true_cam.position).length();
+    let final_pos_err = ((perturbed_cam.position + dp) - true_cam.position).length();
+    assert!(
+        final_pos_err < init_pos_err * 0.6,
+        "pose translation did not converge toward GT: init_err={init_pos_err:.4}, final_err={final_pos_err:.4}, dp={dp:?}"
+    );
+    let init_ang_err = perturbed_cam.rotation.angle_between(true_cam.rotation);
+    let final_ang_err = (dq * perturbed_cam.rotation).angle_between(true_cam.rotation);
+    assert!(
+        final_ang_err < init_ang_err * 0.6,
+        "pose rotation did not converge toward GT: init_ang={init_ang_err:.4}, final_ang={final_ang_err:.4}"
+    );
 }

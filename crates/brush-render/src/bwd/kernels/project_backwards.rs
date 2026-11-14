@@ -103,8 +103,10 @@ fn write_zero_row(
     v_coeffs: &mut Tensor<f32>,
     v_raw_opac: &mut Tensor<f32>,
     v_refine_weight: &mut Tensor<f32>,
+    v_cam_pose: &mut Tensor<f32>,
     row: u32,
     #[comptime] sh_degree: u32,
+    #[comptime] render_cam_grads: bool,
 ) {
     let vbase = (row * 10u32) as usize;
     let coeff_base = row * comptime![num_sh_coeffs(sh_degree) * 3u32];
@@ -116,13 +118,19 @@ fn write_zero_row(
     }
     v_raw_opac[row as usize] = 0.0f32;
     v_refine_weight[row as usize] = 0.0f32;
+    if comptime![render_cam_grads] {
+        let cbase = (row * 6u32) as usize;
+        for k in 0u32..6u32 {
+            v_cam_pose[cbase + k as usize] = 0.0f32;
+        }
+    }
 }
 
 /// Outputs are compact with a zero row in front: row 0 is what culled splats
 /// gather through `compact_from_global`, visible splat `compact_gid` owns row
 /// `compact_gid + 1`. Every row is written, so the buffers need no fill.
 #[cube(launch)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn project_backwards_kernel(
     transforms: &Tensor<f32>,
     sh_coeffs: &Tensor<f32>,
@@ -134,12 +142,14 @@ pub fn project_backwards_kernel(
     v_coeffs: &mut Tensor<f32>,
     v_raw_opac: &mut Tensor<f32>,
     v_refine_weight: &mut Tensor<f32>,
+    v_cam_pose: &mut Tensor<f32>,
     u: ProjectUniforms,
     #[comptime] mip_splatting: bool,
     #[comptime] has_min_scale: bool,
     #[comptime] sh_degree: u32,
     #[comptime] camera_model: CameraModel,
     #[comptime] render_depth: bool,
+    #[comptime] render_cam_grads: bool,
 ) {
     let row = ABSOLUTE_POS as u32;
     if row > u.num_visible {
@@ -151,8 +161,10 @@ pub fn project_backwards_kernel(
             v_coeffs,
             v_raw_opac,
             v_refine_weight,
+            v_cam_pose,
             row,
             sh_degree,
+            render_cam_grads,
         );
         terminate!();
     }
@@ -196,8 +208,10 @@ pub fn project_backwards_kernel(
             v_coeffs,
             v_raw_opac,
             v_refine_weight,
+            v_cam_pose,
             row,
             sh_degree,
+            render_cam_grads,
         );
         terminate!();
     }
@@ -287,7 +301,8 @@ pub fn project_backwards_kernel(
     // v_covar_c = J^T * v_cov2d * J (2x2 sym → 3x3 sym).
     let vcc = cam_jac.transpose_congruence_sym2(v_cov2d);
 
-    let v_mean = view_rot.transpose_mul_vec3(v_mean_c).add(v_mean_from_sh);
+    let v_mean_proj = view_rot.transpose_mul_vec3(v_mean_c);
+    let v_mean = v_mean_proj.add(v_mean_from_sh);
 
     // v_covar = R^T * v_covar_c * R (symmetric).
     // v_M = (v_covar + v_covar^T) * M = 2 * v_covar * M.
@@ -324,4 +339,19 @@ pub fn project_backwards_kernel(
     v_transforms[vbase + 7] = v_scale_exp.x();
     v_transforms[vbase + 8] = v_scale_exp.y();
     v_transforms[vbase + 9] = v_scale_exp.z();
+
+    if comptime![render_cam_grads] {
+        let v_cam_w = v_mean_proj
+            .cross(u_world)
+            .add(v_m.col0().cross(m.col0()))
+            .add(v_m.col1().cross(m.col1()))
+            .add(v_m.col2().cross(m.col2()));
+        let cbase = (row * 6u32) as usize;
+        v_cam_pose[cbase] = -v_mean.x();
+        v_cam_pose[cbase + 1] = -v_mean.y();
+        v_cam_pose[cbase + 2] = -v_mean.z();
+        v_cam_pose[cbase + 3] = v_cam_w.x();
+        v_cam_pose[cbase + 4] = v_cam_w.y();
+        v_cam_pose[cbase + 5] = v_cam_w.z();
+    }
 }

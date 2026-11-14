@@ -164,6 +164,7 @@ async fn run_loader(
                 alpha_mode: view.image.alpha_mode(),
                 camera: view.camera,
                 depth,
+                view_index: index,
             };
 
             let mut cache = cache.lock().await;

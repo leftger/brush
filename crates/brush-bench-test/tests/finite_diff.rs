@@ -1716,3 +1716,99 @@ async fn forward_loss_is_deterministic() {
         "forward loss is nondeterministic ({l_a} vs {l_c})"
     );
 }
+
+/// Finite-difference check for camera pose `se(3)` gradients (`cam_pose_grad_holder`:
+/// `[dp_x, dp_y, dp_z, dw_x, dw_y, dw_z]` with `pos' = pos + dp` and
+/// `rot' = Quat::from_scaled_axis(dw) * rot`). Covers rotated camera, anisotropic
+/// splats, and joint RGB + depth rendering.
+#[tokio::test]
+async fn finite_difference_camera_pose_gradients() {
+    use brush_render::bwd::render_splats_with_options;
+    use brush_render::camera::Camera;
+    use glam::Quat;
+
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let cam = Camera::new(
+        Vec3::new(0.15, -0.1, -3.2),
+        Quat::from_euler(glam::EulerRot::YXZ, 0.18, -0.12, 0.09),
+        0.9,
+        0.9,
+        glam::vec2(0.52, 0.48),
+        CameraModel::Pinhole,
+    );
+    let img_size = glam::uvec2(32, 32);
+    let scene = base_scene();
+    let eps = 1e-3_f32;
+    let rel_tol = 0.02_f32;
+    let abs_tol = 1e-4_f32;
+
+    let eval_cam_loss = |c: &Camera| {
+        let device = &device;
+        let scene = &scene;
+        let c = *c;
+        async move {
+            let splats = build_splats(scene, device);
+            let diff =
+                render_splats_with_options(splats, &c, img_size, Vec3::ZERO, PASS, true, true)
+                    .await;
+            let depth = diff.depth.expect("depth tensor");
+            (diff.img.mean() + depth.mean())
+                .into_scalar_async::<f32>()
+                .await
+                .expect("loss readback")
+        }
+    };
+
+    let splats = build_splats(&scene, &device);
+    let diff = render_splats_with_options(splats, &cam, img_size, Vec3::ZERO, PASS, true, true).await;
+    let depth = diff.depth.expect("depth tensor");
+    let cam_holder = diff
+        .cam_pose_grad_holder
+        .clone()
+        .expect("cam_pose_grad_holder should be present when render_cam_grads=true");
+    let grads = (diff.img.mean() + depth.mean()).backward();
+    let an_grad: Vec<f32> = cam_holder
+        .grad(&grads)
+        .expect("camera pose gradient")
+        .into_data_async()
+        .await
+        .expect("readback")
+        .try_into_vec::<f32>()
+        .expect("f32");
+    assert_eq!(an_grad.len(), 6);
+
+    let mut failed = Vec::new();
+    for comp in 0..6 {
+        let perturb_cam = |delta: f32| {
+            let mut c = cam;
+            if comp < 3 {
+                let mut d = Vec3::ZERO;
+                d[comp] = delta;
+                c.position += d;
+            } else {
+                let mut w = Vec3::ZERO;
+                w[comp - 3] = delta;
+                c.rotation = (Quat::from_scaled_axis(w) * c.rotation).normalize();
+            }
+            c
+        };
+        let l_plus = eval_cam_loss(&perturb_cam(eps)).await;
+        let l_minus = eval_cam_loss(&perturb_cam(-eps)).await;
+        let numerical = (l_plus - l_minus) / (2.0 * eps);
+        let an = an_grad[comp];
+        let abs_err = (numerical - an).abs();
+        let scale = numerical.abs().max(an.abs()).max(1e-8);
+        let tol = abs_tol + rel_tol * scale;
+        if abs_err > tol {
+            failed.push(format!(
+                "pose[{comp}]: numerical {numerical:.6} vs analytical {an:.6} (|Δ|={abs_err:.3e} > tol {tol:.3e})"
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "camera pose finite-diff vs analytical mismatch:\n  {}",
+        failed.join("\n  "),
+    );
+}

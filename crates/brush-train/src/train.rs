@@ -10,9 +10,11 @@ use crate::{
     stats::RefineRecord,
 };
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, depth_loss, image_loss};
-use brush_render::bwd::render_splats_with_depth;
-use brush_render::gaussian_splats::Splats;
+use brush_loss::{
+    DepthLossConfig, ImageLossConfig, depth_loss_with_config, image_loss, opacity_entropy_loss,
+};
+use brush_render::bwd::render_splats_with_options;
+use brush_render::gaussian_splats::{RasterPass, Splats};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use burn::{
     module::Param,
@@ -22,7 +24,7 @@ use burn::{
     },
 };
 
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
 
@@ -65,6 +67,65 @@ fn step_param<const D: usize>(
     })
 }
 
+/// Per-view `se(3)` camera pose correction and Adam moments.
+#[derive(Clone)]
+struct PoseState {
+    delta_pos: glam::Vec3,
+    delta_rot: glam::Quat,
+    m: [f32; 6],
+    v: [f32; 6],
+    step: u32,
+}
+
+impl Default for PoseState {
+    fn default() -> Self {
+        Self {
+            delta_pos: glam::Vec3::ZERO,
+            delta_rot: glam::Quat::IDENTITY,
+            m: [0.0; 6],
+            v: [0.0; 6],
+            step: 0,
+        }
+    }
+}
+
+fn step_pose_adam(
+    state: &mut PoseState,
+    grad: &[f32],
+    base_lr: f64,
+    global_step: u32,
+    total_iters: u32,
+) {
+    state.step += 1;
+    let t = state.step as i32;
+    let b1 = 0.9_f32;
+    let b2 = 0.999_f32;
+    let eps = 1e-8_f32;
+    let bc1 = 1.0 - b1.powi(t);
+    let bc2 = 1.0 - b2.powi(t);
+    let progress = (global_step as f64 / total_iters.max(1) as f64).clamp(0.0, 1.0);
+    let decay = 0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+    let lr = (base_lr * decay) as f32;
+
+    let mut dp = glam::Vec3::ZERO;
+    let mut dw = glam::Vec3::ZERO;
+    for i in 0..6 {
+        let g = grad[i];
+        state.m[i] = b1 * state.m[i] + (1.0 - b1) * g;
+        state.v[i] = b2 * state.v[i] + (1.0 - b2) * g * g;
+        let m_hat = state.m[i] / bc1;
+        let v_hat = state.v[i] / bc2;
+        let delta = -lr * m_hat / (v_hat.sqrt() + eps);
+        if i < 3 {
+            dp[i] = delta;
+        } else {
+            dw[i - 3] = delta;
+        }
+    }
+    state.delta_pos += dp;
+    state.delta_rot = (glam::Quat::from_scaled_axis(dw) * state.delta_rot).normalize();
+}
+
 pub struct SplatTrainer {
     config: TrainConfig,
     /// Per-step multiplier of the exponential mean-LR schedule:
@@ -87,6 +148,8 @@ pub struct SplatTrainer {
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
     view_cams: Vec<(glam::Vec3, f32)>,
+    /// Per-view `se(3)` camera pose deltas refined online during training.
+    view_poses: HashMap<usize, PoseState>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -149,7 +212,8 @@ impl SplatTrainer {
         // The per-step decay reaching lr_mean_end at the last iteration. With
         // one iteration or fewer there is nothing to decay over (and the
         // exponent 1/iters would be undefined), so hold the LR.
-        let decay = if config.total_train_iters > 1 {
+        let decay = if config.total_train_iters > 1 && config.lr_mean > 0.0 && config.lr_mean_end > 0.0
+        {
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64)
         } else {
             1.0
@@ -195,9 +259,17 @@ impl SplatTrainer {
             max_sh_degree: 0,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
+            view_poses: HashMap::new(),
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
+    }
+
+    /// Current refined `(delta_pos, delta_rot)` for `view_index`, if any step has updated it.
+    pub fn view_pose_delta(&self, view_index: usize) -> Option<(glam::Vec3, glam::Quat)> {
+        self.view_poses
+            .get(&view_index)
+            .map(|s| (s.delta_pos, s.delta_rot))
     }
 
     /// Percentile bounding box of the splats, refreshed on each refine.
@@ -221,7 +293,14 @@ impl SplatTrainer {
         self.step_count += 1;
 
         let [img_h, img_w] = batch.img_size();
-        let camera = batch.camera;
+        let view_index = batch.view_index;
+        let mut camera = batch.camera;
+        if self.config.lr_pose > 0.0
+            && let Some(state) = self.view_poses.get(&view_index)
+        {
+            camera.position += state.delta_pos;
+            camera.rotation = (state.delta_rot * camera.rotation).normalize();
+        }
 
         let device = splats.device();
         let has_alpha = batch.has_alpha;
@@ -264,17 +343,21 @@ impl SplatTrainer {
             refine_weight,
             max_radius,
             coeffs_grad_sq,
+            cam_pose_grad,
         ) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
             let render_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
-            let diff_out = render_splats_with_depth(
+            let render_cam_grads = self.config.lr_pose > 0.0;
+            let diff_out = render_splats_with_options(
                 render_input,
                 &camera,
                 img_size,
                 background,
+                RasterPass::Backward,
                 render_depth,
+                render_cam_grads,
             )
             .instrument(trace_span!("Forward"))
             .await;
@@ -282,6 +365,7 @@ impl SplatTrainer {
             let pred_image = diff_out.img;
             let pred_depth = diff_out.depth;
             let refine_weight_holder = diff_out.refine_weight_holder;
+            let cam_pose_grad_holder = diff_out.cam_pose_grad_holder;
             let visible = diff_out.visible;
             let max_radius = diff_out.max_radius;
             let opacities = diff_out.opacities;
@@ -338,9 +422,26 @@ impl SplatTrainer {
             {
                 let gt_depth: Tensor<2> = Tensor::from_data(gt_depth_data, &device.clone().inner());
                 let pred_alpha = pred_image.clone().slice(s![.., .., 3..4]).squeeze_dim::<2>(2);
+                let depth_cfg = DepthLossConfig {
+                    huber_delta: self.config.depth_huber_delta,
+                    edge_threshold: self.config.depth_edge_threshold,
+                    range_weight: !self.config.no_depth_range_weight,
+                };
                 loss = loss
-                    + depth_loss(pred_depth, pred_alpha, Tensor::from_inner(gt_depth))
-                        * self.config.depth_loss_weight;
+                    + depth_loss_with_config(
+                        pred_depth,
+                        pred_alpha,
+                        Tensor::from_inner(gt_depth),
+                        depth_cfg,
+                    ) * self.config.depth_loss_weight;
+            }
+
+            if self.config.opac_entropy_weight > 0.0 {
+                loss = loss
+                    + opacity_entropy_loss(
+                        splats.raw_opacities.val(),
+                        Tensor::from_inner(visible.clone()),
+                    ) * self.config.opac_entropy_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -358,6 +459,9 @@ impl SplatTrainer {
                 .coeffs_grad_sq_holder
                 .grad_remove(&mut grads)
                 .map(Tensor::without_autodiff);
+            let cam_pose_grad = cam_pose_grad_holder
+                .and_then(|h| h.grad_remove(&mut grads))
+                .map(Tensor::without_autodiff);
 
             (
                 grads,
@@ -368,6 +472,7 @@ impl SplatTrainer {
                 refine_weight,
                 max_radius,
                 coeffs_grad_sq,
+                cam_pose_grad,
             )
         };
 
@@ -466,6 +571,27 @@ impl SplatTrainer {
             let out = inner.slice_assign(s![.., 0..3], noised_means);
             Tensor::from_inner(out).require_grad()
         });
+
+        if let Some(cam_pose_grad) = cam_pose_grad
+            && self.config.lr_pose > 0.0
+        {
+            let grad_vec: Vec<f32> = cam_pose_grad
+                .into_data_async()
+                .await
+                .expect("camera pose grad readback")
+                .try_into_vec()
+                .expect("f32 camera pose grad");
+            if grad_vec.len() == 6 && grad_vec.iter().all(|v| v.is_finite()) {
+                let state = self.view_poses.entry(view_index).or_default();
+                step_pose_adam(
+                    state,
+                    &grad_vec,
+                    self.config.lr_pose,
+                    self.step_count,
+                    self.config.total_train_iters,
+                );
+            }
+        }
 
         let stats = TrainStepStats {
             num_visible,

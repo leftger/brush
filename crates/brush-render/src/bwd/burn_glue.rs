@@ -31,6 +31,7 @@ pub(crate) struct SplatGrads<B: Backend> {
     pub v_coeffs: FloatTensor<B>,
     pub v_raw_opac: FloatTensor<B>,
     pub v_refine_weight: FloatTensor<B>,
+    pub v_cam_pose: FloatTensor<B>,
 }
 
 /// Concrete backward kernels behind [`SplatOps::render`]. Deliberately not
@@ -87,6 +88,7 @@ mod bwd_ops {
             render_mode: SplatRenderMode,
             v_combined: FloatTensor<Self>,
             render_depth: bool,
+            render_cam_grads: bool,
         ) -> SplatGrads<Self>;
     }
 }
@@ -123,15 +125,22 @@ fn project_bwd_metadata(
     _render_mode: &SplatRenderMode,
     _v_combined: &TensorSpec,
     _render_depth: &bool,
+    render_cam_grads: &bool,
 ) -> SplatGradsMetadata {
     let rows = project_uniforms.num_visible as usize + 1;
     let coeffs = sh_coeffs_for_degree(project_uniforms.sh_degree) as usize;
     let f32_spec = |shape: Shape| TensorSpec::new(shape, DType::F32);
+    let v_cam_pose = if *render_cam_grads {
+        f32_spec(Shape::new([rows, 6]))
+    } else {
+        f32_spec(Shape::new([1, 1]))
+    };
     SplatGradsMetadata {
         v_transforms: f32_spec(Shape::new([rows, 10])),
         v_coeffs: f32_spec(Shape::new([rows, coeffs, 3])),
         v_raw_opac: f32_spec(Shape::new([rows])),
         v_refine_weight: f32_spec(Shape::new([rows])),
+        v_cam_pose,
     }
 }
 
@@ -158,12 +167,13 @@ struct GaussianBackwardState<B: Backend> {
     background: Vec3,
     img_size: glam::UVec2,
     render_depth: bool,
+    render_cam_grads: bool,
 }
 
 #[derive(Debug)]
 struct RenderBackwards;
 
-const NUM_BWD_ARGS: usize = 5;
+const NUM_BWD_ARGS: usize = 6;
 
 // Implement gradient registration when rendering backwards.
 impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
@@ -188,6 +198,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             coeffs_parent,
             raw_opacity_parent,
             coeffs_grad_sq_parent,
+            cam_pose_grad_parent,
         ] = ops.parents;
 
         let v_combined = B::rasterize_bwd(
@@ -213,6 +224,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             state.render_mode,
             v_combined,
             state.render_depth,
+            state.render_cam_grads,
         );
 
         // The kernels write compact gradients with a zero row in front, and
@@ -253,6 +265,13 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
             let mean = B::float_div_scalar(sq, burn::tensor::Scalar::Float(trailing as f64));
             grads.register::<B>(node.id, B::float_select(mean, 0, inv));
         }
+
+        if let Some(node) = cam_pose_grad_parent
+            && state.render_cam_grads
+        {
+            let summed = B::float_sum_dims(splat_grads.v_cam_pose, &[0]);
+            grads.register::<B>(node.id, B::float_reshape(summed, [6].into()));
+        }
     }
 }
 
@@ -277,6 +296,10 @@ pub struct SplatOutputDiff {
     /// This statistic is for one render/backward; it cannot be added across
     /// renders to obtain the mean square of an accumulated SH gradient.
     pub coeffs_grad_sq_holder: Tensor<3>,
+    /// Catches `[dp_x, dp_y, dp_z, dw_x, dw_y, dw_z]` camera-pose gradients
+    /// (`R_wc' = exp([w]_x) * R_wc`, `p_wc' = p_wc + dp`) when `render_cam_grads`
+    /// is enabled.
+    pub cam_pose_grad_holder: Option<Tensor<1>>,
 }
 
 /// Render splats on a differentiable device.
@@ -288,12 +311,13 @@ pub async fn render_splats(
     img_size: glam::UVec2,
     background: Vec3,
 ) -> SplatOutputDiff {
-    render_splats_with_pass_and_depth(
+    render_splats_with_options(
         splats,
         camera,
         img_size,
         background,
         crate::gaussian_splats::RasterPass::Backward,
+        false,
         false,
     )
     .await
@@ -308,13 +332,14 @@ pub async fn render_splats_with_depth(
     background: Vec3,
     render_depth: bool,
 ) -> SplatOutputDiff {
-    render_splats_with_pass_and_depth(
+    render_splats_with_options(
         splats,
         camera,
         img_size,
         background,
         crate::gaussian_splats::RasterPass::Backward,
         render_depth,
+        false,
     )
     .await
 }
@@ -329,7 +354,7 @@ pub async fn render_splats_with_pass(
     background: Vec3,
     pass: crate::gaussian_splats::RasterPass,
 ) -> SplatOutputDiff {
-    render_splats_with_pass_and_depth(splats, camera, img_size, background, pass, false).await
+    render_splats_with_options(splats, camera, img_size, background, pass, false, false).await
 }
 
 /// Differentiable render with explicit [`crate::gaussian_splats::RasterPass`]
@@ -342,6 +367,29 @@ pub async fn render_splats_with_pass_and_depth(
     pass: crate::gaussian_splats::RasterPass,
     render_depth: bool,
 ) -> SplatOutputDiff {
+    render_splats_with_options(
+        splats,
+        camera,
+        img_size,
+        background,
+        pass,
+        render_depth,
+        false,
+    )
+    .await
+}
+
+/// Full differentiable render entrypoint with optional depth output and camera
+/// pose gradient computation.
+pub async fn render_splats_with_options(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: crate::gaussian_splats::RasterPass,
+    render_depth: bool,
+    render_cam_grads: bool,
+) -> SplatOutputDiff {
     splats.clone().validate_values().await;
 
     let device = splats.device();
@@ -352,6 +400,11 @@ pub async fn render_splats_with_pass_and_depth(
 
     let refine_weight_holder = Tensor::<1>::zeros([1], &device).require_grad();
     let coeffs_grad_sq_holder = Tensor::<3>::zeros([1, 1, 1], &device).require_grad();
+    let cam_pose_grad_holder =
+        render_cam_grads.then(|| Tensor::<1>::zeros([6], &device).require_grad());
+    let cam_pose_grad_arg = cam_pose_grad_holder
+        .clone()
+        .unwrap_or_else(|| Tensor::<1>::zeros([1], &device));
 
     // The 3D-filter floor is applied inside the projection kernels. It lives
     // on the inner backend and carries no gradient, so lifting it onto the
@@ -380,10 +433,12 @@ pub async fn render_splats_with_pass_and_depth(
         0.0,
         refine_weight_holder.clone().into_dispatch(),
         coeffs_grad_sq_holder.clone().into_dispatch(),
+        cam_pose_grad_arg.into_dispatch(),
         render_mode,
         background,
         pass,
         render_depth,
+        render_cam_grads,
     )
     .await;
 
@@ -406,6 +461,7 @@ pub async fn render_splats_with_pass_and_depth(
         opacities: Tensor::from_dispatch(output.aux.opacities).without_autodiff(),
         refine_weight_holder,
         coeffs_grad_sq_holder,
+        cam_pose_grad_holder,
     }
 }
 
@@ -422,10 +478,12 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
         log_scale_offset: f32,
         refine_weight: FloatTensor<Self>,
         coeffs_grad_sq: FloatTensor<Self>,
+        cam_pose_grad: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
         render_depth: bool,
+        render_cam_grads: bool,
     ) -> crate::RenderOutput<Self> {
         let prep_nodes = RenderBackwards
             .prepare::<NoCheckpointing>([
@@ -434,6 +492,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
                 sh_coeffs.node(),
                 raw_opacities.node(),
                 coeffs_grad_sq.node(),
+                cam_pose_grad.node(),
             ])
             .compute_bound()
             .stateful();
@@ -454,10 +513,12 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
             log_scale_offset,
             refine_weight.into_primitive(),
             coeffs_grad_sq.into_primitive(),
+            cam_pose_grad.into_primitive(),
             render_mode,
             background,
             pass,
             render_depth,
+            render_cam_grads,
         )
         .await;
 
@@ -483,6 +544,7 @@ impl<B: Backend + SplatOps + SplatBwdOps, C: CheckpointStrategy> SplatOps for Au
                     background,
                     img_size,
                     render_depth,
+                    render_cam_grads,
                 };
                 prep.finish(state, output.out_img)
             }

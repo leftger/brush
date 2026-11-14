@@ -344,3 +344,70 @@ async fn depth_loss_masks_invalid_pixels_and_backprops() {
     assert!(g_depth[2].abs() < 1e-6 && g_depth[3].abs() < 1e-6);
     assert!(g_alpha[2].abs() < 1e-6 && g_alpha[3].abs() < 1e-6);
 }
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn robust_depth_loss_suppresses_edges_ranges_and_uses_huber() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // Pixel 0 is flat interior (neighbor also 1.0); pixels 1 & 2 straddle a 1.0 -> 3.0 depth edge.
+    let pred_depth = Tensor::<1>::from_floats([1.5, 1.5, 3.5], &device)
+        .reshape([1, 3])
+        .require_grad();
+    let pred_alpha = Tensor::<1>::from_floats([1.0, 1.0, 1.0], &device).reshape([1, 3]);
+    let gt_depth = Tensor::<1>::from_floats([1.0, 1.0, 3.0], &device).reshape([1, 3]);
+
+    let cfg = brush_loss::DepthLossConfig {
+        huber_delta: 0.05,
+        edge_threshold: 0.05,
+        range_weight: true,
+    };
+    let loss =
+        brush_loss::depth_loss_with_config(pred_depth.clone(), pred_alpha.clone(), gt_depth.clone(), cfg);
+    let grads = loss.backward();
+    let g_depth = to_vec(pred_depth.grad(&grads).expect("depth grad")).await;
+    assert!(g_depth.iter().all(|v| v.is_finite()));
+    // Edge pixels (1 & 2) must be heavily attenuated relative to flat interior pixel 0.
+    assert!(
+        g_depth[1].abs() < 0.05 * g_depth[0].abs() && g_depth[2].abs() < 0.05 * g_depth[0].abs(),
+        "g_depth={g_depth:?}"
+    );
+
+    // Sub-delta error gets quadratic (smaller) Huber gradient vs saturated gradient above delta.
+    let pred_small = Tensor::<1>::from_floats([1.01, 1.01, 3.0], &device)
+        .reshape([1, 3])
+        .require_grad();
+    let loss_small = brush_loss::depth_loss_with_config(pred_small.clone(), pred_alpha, gt_depth, cfg);
+    let grads_small = loss_small.backward();
+    let g_small = to_vec(pred_small.grad(&grads_small).expect("small depth grad")).await;
+    assert!(
+        (g_small[0] / g_depth[0] - 0.2).abs() < 0.02,
+        "expected Huber quadratic slope 0.01/0.05=0.2, got {}",
+        g_small[0] / g_depth[0]
+    );
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn opacity_entropy_loss_peaks_at_half_and_vanishes_at_extremes() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let active = Tensor::<1>::from_floats([1.0, 1.0, 0.0], &device);
+    let mid_raw = Tensor::<1>::from_floats([0.0, 0.0, 0.0], &device).require_grad();
+    let sharp_raw = Tensor::<1>::from_floats([-10.0, 10.0, 0.0], &device);
+
+    let l_mid = brush_loss::opacity_entropy_loss(mid_raw.clone(), active.clone())
+        .into_scalar_async::<f32>()
+        .await
+        .expect("readback");
+    let l_sharp = brush_loss::opacity_entropy_loss(sharp_raw, active.clone())
+        .into_scalar_async::<f32>()
+        .await
+        .expect("readback");
+    assert!((l_mid - std::f32::consts::LN_2).abs() < 1e-3, "l_mid={l_mid}");
+    assert!(l_sharp < 2e-3, "l_sharp={l_sharp}");
+
+    let grads = brush_loss::opacity_entropy_loss(mid_raw.clone(), active).backward();
+    let g = to_vec(mid_raw.grad(&grads).expect("opac grad")).await;
+    // Masked-out splat receives zero gradient; p=0.5 is a stationary maximum (grad ~ 0).
+    assert!(g[2].abs() < 1e-6);
+    assert!(g[0].abs() < 1e-5);
+}

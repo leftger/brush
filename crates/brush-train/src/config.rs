@@ -101,10 +101,30 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
 
-    /// Weight of L1 depth loss when ground-truth depth maps are present in the dataset.
+    /// Weight of L1/Huber depth loss when ground-truth depth maps are present in the dataset.
     /// Set to 0 to disable depth supervision.
     #[arg(long, help_heading = "Training options", default_value = "0.1")]
     pub depth_loss_weight: f32,
+
+    /// Huber transition delta (metres) for depth loss; 0 uses pure L1.
+    #[arg(long, help_heading = "Training options", default_value = "0.05")]
+    pub depth_huber_delta: f32,
+
+    /// Relative GT depth step threshold for downweighting depth silhouettes; 0 disables edge masking.
+    #[arg(long, help_heading = "Training options", default_value = "0.05")]
+    pub depth_edge_threshold: f32,
+
+    /// Disable `1 / (1 + depth)` inverse-range weighting on depth loss.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    pub no_depth_range_weight: bool,
+
+    /// Weight of binary-opacity entropy regularization pushing splats toward 0 or 1 opacity.
+    #[arg(long, help_heading = "Refine options", default_value = "0.0001")]
+    pub opac_entropy_weight: f32,
+
+    /// Learning rate for per-view `se(3)` camera pose refinement; 0 disables pose optimization.
+    #[arg(long, help_heading = "Refine options", default_value = "1e-4")]
+    pub lr_pose: f64,
 
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,

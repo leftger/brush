@@ -32,7 +32,7 @@ use burn::{
         },
         tensor::{FloatTensor, IntTensor},
     },
-    tensor::{DType, Int, Shape, Tensor},
+    tensor::{DType, Int, Shape, Tensor, s},
 };
 use burn_cubecl::{CubeBackend, kernel::into_contiguous, tensor::CubeTensor};
 use glam::Vec3;
@@ -1280,13 +1280,130 @@ pub fn unpack_gt_rgb(gt_packed: Tensor<2, Int>, composite_bg: Option<Vec3>) -> T
 /// the numerator and denominator so unpopulated background or low-opacity edge
 /// pixels do not amplify `1 / alpha` gradients.
 pub fn depth_loss(pred_depth: Tensor<2>, pred_alpha: Tensor<2>, gt_depth: Tensor<2>) -> Tensor<1> {
+    depth_loss_with_config(
+        pred_depth,
+        pred_alpha,
+        gt_depth,
+        DepthLossConfig {
+            huber_delta: 0.0,
+            edge_threshold: 0.0,
+            range_weight: false,
+        },
+    )
+}
+
+/// Configuration for robust metric depth supervision ([`depth_loss_with_config`]).
+#[derive(Clone, Copy, Debug)]
+pub struct DepthLossConfig {
+    /// Huber (Smooth L1) transition in metres (`0` uses pure L1).
+    pub huber_delta: f32,
+    /// Relative depth-jump threshold between adjacent GT pixels for Cauchy edge
+    /// downweighting (`0` disables edge suppression).
+    pub edge_threshold: f32,
+    /// Multiply per-pixel weight by `1 / (1 + gt_depth)` to emphasize closer geometry.
+    pub range_weight: bool,
+}
+
+impl Default for DepthLossConfig {
+    fn default() -> Self {
+        Self {
+            huber_delta: 0.05,
+            edge_threshold: 0.05,
+            range_weight: true,
+        }
+    }
+}
+
+/// Edge-masked, range-weighted Huber depth loss between expected splat depth
+/// (`pred_depth / pred_alpha`) and ground-truth metric depth (`[H, W]`).
+pub fn depth_loss_with_config(
+    pred_depth: Tensor<2>,
+    pred_alpha: Tensor<2>,
+    gt_depth: Tensor<2>,
+    config: DepthLossConfig,
+) -> Tensor<1> {
     const MIN_ALPHA: f32 = 1e-2;
-    let valid = gt_depth
+    let gt_valid = gt_depth.clone().greater_elem(0.0);
+    let valid = gt_valid
         .clone()
-        .greater_elem(0.0)
-        .bool_and(pred_alpha.clone().greater_elem(MIN_ALPHA))
-        .float();
-    let count = valid.clone().sum().clamp_min(1.0);
+        .bool_and(pred_alpha.clone().greater_elem(MIN_ALPHA));
+
+    let mut weights = valid.float();
+
+    // Suppress depth silhouettes / flying pixels by measuring the max relative
+    // step to valid 4-neighbors on the GT depth map.
+    if config.edge_threshold > 0.0 {
+        let [h, w] = gt_depth.dims();
+        let inv_thresh_sq = 1.0 / (config.edge_threshold * config.edge_threshold);
+        let gt_inner = gt_depth.clone().detach();
+        let valid_inner = gt_valid.float();
+        let safe_d = gt_inner.clone().clamp_min(1e-3);
+        let mut max_rel_sq = weights.zeros_like();
+
+        if w > 1 {
+            let d_left = gt_inner.clone().slice(s![.., 0..(w - 1)]);
+            let d_right = gt_inner.clone().slice(s![.., 1..w]);
+            let v_pair = valid_inner.clone().slice(s![.., 0..(w - 1)])
+                * valid_inner.clone().slice(s![.., 1..w]);
+            let diff = (d_left - d_right).abs() * v_pair;
+
+            let rel_l = diff.clone() / safe_d.clone().slice(s![.., 0..(w - 1)]);
+            let rel_r = diff / safe_d.clone().slice(s![.., 1..w]);
+
+            let zero_col = gt_inner.clone().slice(s![.., 0..1]).zeros_like();
+            let grad_r = Tensor::cat(vec![rel_l.powi_scalar(2), zero_col.clone()], 1);
+            let grad_l = Tensor::cat(vec![zero_col, rel_r.powi_scalar(2)], 1);
+            max_rel_sq = max_rel_sq.max_pair(grad_r).max_pair(grad_l);
+        }
+        if h > 1 {
+            let d_up = gt_inner.clone().slice(s![0..(h - 1), ..]);
+            let d_down = gt_inner.slice(s![1..h, ..]);
+            let v_pair = valid_inner.clone().slice(s![0..(h - 1), ..])
+                * valid_inner.slice(s![1..h, ..]);
+            let diff = (d_up - d_down).abs() * v_pair;
+
+            let rel_u = diff.clone() / safe_d.clone().slice(s![0..(h - 1), ..]);
+            let rel_d = diff / safe_d.slice(s![1..h, ..]);
+
+            let zero_row = gt_depth.clone().slice(s![0..1, ..]).zeros_like();
+            let grad_d = Tensor::cat(vec![rel_u.powi_scalar(2), zero_row.clone()], 0);
+            let grad_u = Tensor::cat(vec![zero_row, rel_d.powi_scalar(2)], 0);
+            max_rel_sq = max_rel_sq.max_pair(grad_d).max_pair(grad_u);
+        }
+
+        let edge_w = (max_rel_sq.mul_scalar(inv_thresh_sq) + 1.0).recip();
+        weights = weights * edge_w;
+    }
+
+    if config.range_weight {
+        let range_w = (gt_depth.clone().clamp_min(0.0) + 1.0).recip();
+        weights = weights * range_w;
+    }
+
     let expected = pred_depth / pred_alpha.clamp_min(MIN_ALPHA);
-    ((expected - gt_depth).abs() * valid).sum() / count
+    let abs_err = (expected - gt_depth).abs();
+    let per_pixel = if config.huber_delta > 0.0 {
+        let quad = abs_err.clone().clamp_max(config.huber_delta);
+        let lin = abs_err - quad.clone();
+        quad.powi_scalar(2).mul_scalar(0.5 / config.huber_delta) + lin
+    } else {
+        abs_err
+    };
+
+    let denom = weights.clone().sum().clamp_min(1.0);
+    (per_pixel * weights).sum() / denom
+}
+
+/// Binary-opacity entropy regularizer over active splats (`mask` in `{0, 1}`).
+///
+/// Penalizes fuzzy mid-range opacities (`0 < p < 1`) to push splats toward
+/// crisp opaque geometry (`p -> 1`) or empty space (`p -> 0`).
+pub fn opacity_entropy_loss(raw_opacities: Tensor<1>, active_mask: Tensor<1>) -> Tensor<1> {
+    const EPS: f32 = 1e-4;
+    let p = burn::tensor::activation::sigmoid(raw_opacities).clamp(EPS, 1.0 - EPS);
+    let one_minus_p: Tensor<1> = 1.0 - p.clone();
+    let entropy = -(p.clone() * p.log() + one_minus_p.clone() * one_minus_p.log());
+    let mask = active_mask.detach();
+    let count = mask.clone().sum().clamp_min(1.0);
+    (entropy * mask).sum() / count
 }

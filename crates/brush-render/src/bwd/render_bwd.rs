@@ -115,6 +115,7 @@ impl SplatBwdOps for CubeBackend {
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
         render_depth: bool,
+        render_cam_grads: bool,
     ) -> SplatGrads<Self> {
         let _span = tracing::trace_span!("project_bwd").entered();
 
@@ -138,6 +139,11 @@ impl SplatBwdOps for CubeBackend {
         let v_coeffs = create_tensor([rows, coeffs, 3], &device, DType::F32);
         let v_raw_opac = create_tensor([rows], &device, DType::F32);
         let v_refine_weight = create_tensor([rows], &device, DType::F32);
+        let v_cam_pose = if render_cam_grads {
+            create_tensor([rows, 6], &device, DType::F32)
+        } else {
+            create_tensor([1, 1], &device, DType::F32)
+        };
 
         let uniforms = project_uniforms.to_launch_object();
         let cube_dim = CubeDim::new_1d(kernels::project_backwards::WG_SIZE);
@@ -157,12 +163,14 @@ impl SplatBwdOps for CubeBackend {
                 v_coeffs.clone().into_tensor_arg(),
                 v_raw_opac.clone().into_tensor_arg(),
                 v_refine_weight.clone().into_tensor_arg(),
+                v_cam_pose.clone().into_tensor_arg(),
                 uniforms,
                 mip_splat,
                 has_min_scale,
                 project_uniforms.sh_degree,
                 project_uniforms.camera_model,
                 render_depth,
+                render_cam_grads,
             );
         });
 
@@ -171,6 +179,7 @@ impl SplatBwdOps for CubeBackend {
             v_coeffs,
             v_raw_opac,
             v_refine_weight,
+            v_cam_pose,
         }
     }
 }

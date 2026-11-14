@@ -77,6 +77,7 @@ fn test_batch(width: u32, height: u32) -> SceneBatch {
             Pinhole,
         ),
         depth: None,
+        view_index: 0,
     }
 }
 

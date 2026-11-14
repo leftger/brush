@@ -88,10 +88,12 @@ impl SplatOps for Fusion<CubeBackend> {
         log_scale_offset: f32,
         refine_weight: FloatTensor<Self>,
         coeffs_grad_sq: FloatTensor<Self>,
+        cam_pose_grad: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
         render_depth: bool,
+        render_cam_grads: bool,
     ) -> RenderOutput<Self> {
         let client = transforms.client.clone();
 
@@ -115,6 +117,9 @@ impl SplatOps for Fusion<CubeBackend> {
         let base_coeffs_grad_sq = client
             .clone()
             .resolve_tensor_float::<CubeBackend>(coeffs_grad_sq);
+        let base_cam_pose_grad = client
+            .clone()
+            .resolve_tensor_float::<CubeBackend>(cam_pose_grad);
 
         let out = <CubeBackend as SplatOps>::render(
             camera,
@@ -127,10 +132,12 @@ impl SplatOps for Fusion<CubeBackend> {
             log_scale_offset,
             base_refine_weight,
             base_coeffs_grad_sq,
+            base_cam_pose_grad,
             render_mode,
             background,
             pass,
             render_depth,
+            render_cam_grads,
         )
         .await;
 
