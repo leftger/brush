@@ -11,11 +11,13 @@ use crate::{
 };
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{
-    DepthLossConfig, ImageLossConfig, depth_loss_with_config, image_loss, opacity_entropy_loss,
+    DepthLossConfig, ImageLossConfig, depth_loss_with_config, image_gradient_loss, image_loss,
+    normal_consistency_loss, opacity_entropy_loss, scale_regularization_loss,
+    splat_sh0_camera_normals,
 };
 use brush_render::bwd::render_splats_with_options;
 use brush_render::gaussian_splats::{RasterPass, Splats};
-use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
+use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::{SH_C0, sh_coeffs_for_degree}};
 use burn::{
     module::Param,
     tensor::{
@@ -126,6 +128,178 @@ fn step_pose_adam(
     state.delta_rot = (glam::Quat::from_scaled_axis(dw) * state.delta_rot).normalize();
 }
 
+/// Per-view affine colour matrix + bias (`c' = mat * c + bias`) and Adam moments.
+#[derive(Clone, Debug)]
+pub struct AppearanceState {
+    pub mat: [f32; 9],
+    pub bias: [f32; 3],
+    m: [f32; 12],
+    v: [f32; 12],
+    step: u32,
+}
+
+impl Default for AppearanceState {
+    fn default() -> Self {
+        Self {
+            mat: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            bias: [0.0; 3],
+            m: [0.0; 12],
+            v: [0.0; 12],
+            step: 0,
+        }
+    }
+}
+
+fn step_appearance_adam(
+    state: &mut AppearanceState,
+    mat_grad: &[f32],
+    bias_grad: &[f32],
+    base_lr: f64,
+    global_step: u32,
+    total_iters: u32,
+) {
+    state.step += 1;
+    let t = state.step as i32;
+    let b1 = 0.9_f32;
+    let b2 = 0.999_f32;
+    let eps = 1e-8_f32;
+    let bc1 = 1.0 - b1.powi(t);
+    let bc2 = 1.0 - b2.powi(t);
+    let progress = (global_step as f64 / total_iters.max(1) as f64).clamp(0.0, 1.0);
+    let decay = 0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+    let lr = (base_lr * decay) as f32;
+
+    for i in 0..9 {
+        let g = mat_grad[i];
+        state.m[i] = b1 * state.m[i] + (1.0 - b1) * g;
+        state.v[i] = b2 * state.v[i] + (1.0 - b2) * g * g;
+        let m_hat = state.m[i] / bc1;
+        let v_hat = state.v[i] / bc2;
+        state.mat[i] = (state.mat[i] - lr * m_hat / (v_hat.sqrt() + eps)).clamp(-2.0, 2.0);
+    }
+    for j in 0..3 {
+        let idx = 9 + j;
+        let g = bias_grad[j];
+        state.m[idx] = b1 * state.m[idx] + (1.0 - b1) * g;
+        state.v[idx] = b2 * state.v[idx] + (1.0 - b2) * g * g;
+        let m_hat = state.m[idx] / bc1;
+        let v_hat = state.v[idx] / bc2;
+        state.bias[j] = (state.bias[j] - lr * m_hat / (v_hat.sqrt() + eps)).clamp(-0.5, 0.5);
+    }
+}
+
+fn cosine_decay_scale(step: u32, total_iters: u32, min_scale: f32) -> f32 {
+    let min_scale = min_scale.clamp(0.0, 1.0);
+    if total_iters <= 1 || min_scale >= 1.0 {
+        return 1.0;
+    }
+    let progress = ((step.saturating_sub(1)) as f32 / (total_iters - 1) as f32).clamp(0.0, 1.0);
+    min_scale + (1.0 - min_scale) * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
+}
+
+fn coarse_scale_for_step(step: u32, warmup_iters: u32, start_scale: f32) -> Option<f32> {
+    if warmup_iters == 0 || step > warmup_iters {
+        return None;
+    }
+    let start = start_scale.clamp(0.1, 1.0);
+    if start >= 0.99 {
+        return None;
+    }
+    // 3 discrete resolution tiers over the warmup window avoid thrashing shaders
+    // on every single iteration while stepping cleanly from coarse to full res.
+    let frac = (step - 1) as f32 / warmup_iters.max(1) as f32;
+    if frac < 0.33 {
+        Some(start)
+    } else if frac < 0.67 {
+        Some((start + 1.0) * 0.5)
+    } else {
+        None
+    }
+}
+
+fn downsample_batch(batch: &SceneBatch, scale: f32) -> SceneBatch {
+    let [h, w] = batch.img_size();
+    let new_h = (((h as f32 * scale).round() as usize).max(64).min(h)) & !1;
+    let new_w = (((w as f32 * scale).round() as usize).max(64).min(w)) & !1;
+    if new_h >= h || new_w >= w {
+        return batch.clone();
+    }
+
+    let Ok(src_packed) = batch.img_packed.as_slice::<i32>() else {
+        return batch.clone();
+    };
+    let mut dst_packed = Vec::with_capacity(new_h * new_w);
+    let sx = w as f32 / new_w as f32;
+    let sy = h as f32 / new_h as f32;
+
+    for y in 0..new_h {
+        let y0 = ((y as f32 * sy).floor() as usize).min(h - 1);
+        let y1 = (((y + 1) as f32 * sy).ceil() as usize).clamp(y0 + 1, h);
+        for x in 0..new_w {
+            let x0 = ((x as f32 * sx).floor() as usize).min(w - 1);
+            let x1 = (((x + 1) as f32 * sx).ceil() as usize).clamp(x0 + 1, w);
+            let mut sum = [0u32; 4];
+            let mut count = 0u32;
+            for yy in y0..y1 {
+                let row = yy * w;
+                for xx in x0..x1 {
+                    let bytes = src_packed[row + xx].to_le_bytes();
+                    sum[0] += bytes[0] as u32;
+                    sum[1] += bytes[1] as u32;
+                    sum[2] += bytes[2] as u32;
+                    sum[3] += bytes[3] as u32;
+                    count += 1;
+                }
+            }
+            let c = count.max(1);
+            dst_packed.push(i32::from_le_bytes([
+                (sum[0] / c) as u8,
+                (sum[1] / c) as u8,
+                (sum[2] / c) as u8,
+                (sum[3] / c) as u8,
+            ]));
+        }
+    }
+
+    let depth = batch.depth.as_ref().and_then(|d| {
+        let Ok(src_d) = d.as_slice::<f32>() else {
+            return None;
+        };
+        let mut dst_d = Vec::with_capacity(new_h * new_w);
+        for y in 0..new_h {
+            let y0 = ((y as f32 * sy).floor() as usize).min(h - 1);
+            let y1 = (((y + 1) as f32 * sy).ceil() as usize).clamp(y0 + 1, h);
+            for x in 0..new_w {
+                let x0 = ((x as f32 * sx).floor() as usize).min(w - 1);
+                let x1 = (((x + 1) as f32 * sx).ceil() as usize).clamp(x0 + 1, w);
+                let mut dsum = 0.0f32;
+                let mut dcnt = 0u32;
+                for yy in y0..y1 {
+                    let row = yy * w;
+                    for xx in x0..x1 {
+                        let v = src_d[row + xx];
+                        if v.is_finite() && v > 0.0 {
+                            dsum += v;
+                            dcnt += 1;
+                        }
+                    }
+                }
+                dst_d.push(if dcnt > 0 { dsum / dcnt as f32 } else { 0.0 });
+            }
+        }
+        Some(TensorData::new(dst_d, [new_h, new_w]))
+    });
+
+    SceneBatch {
+        img_packed: TensorData::new(dst_packed, [new_h, new_w]),
+        has_alpha: batch.has_alpha,
+        alpha_mode: batch.alpha_mode,
+        camera: batch.camera,
+        depth,
+        view_index: batch.view_index,
+    }
+}
+
 pub struct SplatTrainer {
     config: TrainConfig,
     /// Per-step multiplier of the exponential mean-LR schedule:
@@ -150,6 +324,8 @@ pub struct SplatTrainer {
     view_cams: Vec<(glam::Vec3, f32)>,
     /// Per-view `se(3)` camera pose deltas refined online during training.
     view_poses: HashMap<usize, PoseState>,
+    /// Per-view affine RGB colour matrix & bias refined online during training.
+    view_appearances: HashMap<usize, AppearanceState>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -260,6 +436,7 @@ impl SplatTrainer {
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
             view_poses: HashMap::new(),
+            view_appearances: HashMap::new(),
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -270,6 +447,13 @@ impl SplatTrainer {
         self.view_poses
             .get(&view_index)
             .map(|s| (s.delta_pos, s.delta_rot))
+    }
+
+    /// Current refined per-view affine appearance `(mat_3x3, bias_3)` for `view_index`.
+    pub fn view_appearance(&self, view_index: usize) -> Option<([f32; 9], [f32; 3])> {
+        self.view_appearances
+            .get(&view_index)
+            .map(|s| (s.mat, s.bias))
     }
 
     /// Percentile bounding box of the splats, refreshed on each refine.
@@ -291,6 +475,18 @@ impl SplatTrainer {
             self.max_sh_degree = splats.sh_degree();
         }
         self.step_count += 1;
+
+        let [raw_h, raw_w] = batch.img_size();
+        let batch = if raw_h.min(raw_w) >= 256
+            && let Some(scale) = coarse_scale_for_step(
+                self.step_count,
+                self.config.coarse_warmup_iters,
+                self.config.coarse_scale_start,
+            ) {
+            downsample_batch(&batch, scale)
+        } else {
+            batch
+        };
 
         let [img_h, img_w] = batch.img_size();
         let view_index = batch.view_index;
@@ -334,6 +530,14 @@ impl SplatTrainer {
         let lr_scaling =
             self.lr_scaling_fixed.clone() + self.lr_mean_columns.clone() * lr_mean as f32;
 
+        let depth_weight = self.config.depth_loss_weight
+            * cosine_decay_scale(
+                self.step_count,
+                self.config.total_train_iters,
+                self.config.depth_loss_min_scale,
+            );
+        let appearance_enabled = self.config.lr_appearance > 0.0 && self.config.lr_coeffs_dc > 0.0;
+
         let (
             mut grads,
             visible,
@@ -344,11 +548,31 @@ impl SplatTrainer {
             max_radius,
             coeffs_grad_sq,
             cam_pose_grad,
+            appearance_grads,
         ) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
-            let render_input = splats.clone();
-            let render_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
+            let mut render_input = splats.clone();
+            let total_coeffs = splats.sh_coeffs.dims()[1];
+            let active_deg = if self.config.sh_warmup_every == 0 {
+                self.max_sh_degree
+            } else {
+                ((self.step_count - 1) / self.config.sh_warmup_every).min(self.max_sh_degree)
+            };
+            let active_coeffs = (sh_coeffs_for_degree(active_deg) as usize).min(total_coeffs);
+            if active_coeffs < total_coeffs {
+                let mut mask_vals = vec![0.0f32; total_coeffs];
+                mask_vals[..active_coeffs].fill(1.0);
+                let sh_mask = Tensor::<1>::from_floats(mask_vals.as_slice(), &device)
+                    .reshape([1, total_coeffs, 1]);
+                render_input.sh_coeffs = render_input.sh_coeffs.map(|c| c * sh_mask);
+            }
+
+            let normal_enabled = self.config.normal_loss_weight > 0.0
+                && splats.num_splats() > 0
+                && (self.config.lr_rotation > 0.0 || self.config.lr_mean > 0.0)
+                && (batch.depth.is_some() || self.config.normal_loss_rgb);
+            let render_depth = (batch.depth.is_some() && depth_weight > 0.0) || normal_enabled;
             let render_cam_grads = self.config.lr_pose > 0.0;
             let diff_out = render_splats_with_options(
                 render_input,
@@ -370,22 +594,35 @@ impl SplatTrainer {
             let max_radius = diff_out.max_radius;
             let opacities = diff_out.opacities;
 
-            // RGB loss is `(1 - w) * L1 + (-w) * SSIM` per pixel. Bg
-            // compositing always runs in the kernel; for synthesised opaque
-            // alpha or zero bg it's a no-op. Mask multiplies the loss-map
-            // by `gt.a`; for synthesised opaque alpha that's a no-op too.
-            // Alpha matching needs a real alpha source (synthesised
-            // a = 1 would pull predicted alpha to fully opaque); we feed
-            // `pred` with 4 channels and the kernel's `c == 3` workgroup
-            // emits `|pred.a - gt.a|` into the alpha channel.
+            let pred_alpha = pred_image.clone().slice(s![.., .., 3..4]).squeeze_dim::<2>(2);
+
+            // Optional per-view 3x3 affine RGB correction before photometric losses.
+            let (pred_for_loss, app_handles) = if appearance_enabled {
+                let app_state = self.view_appearances.entry(view_index).or_default();
+                let mat_t = Tensor::<1>::from_floats(app_state.mat, &device)
+                    .reshape([3, 3])
+                    .require_grad();
+                let bias_t = Tensor::<1>::from_floats(app_state.bias, &device)
+                    .reshape([1, 3])
+                    .require_grad();
+                let rgb = pred_image.clone().slice(s![.., .., 0..3]);
+                let adj_rgb = (rgb
+                    .reshape([img_h * img_w, 3])
+                    .matmul(mat_t.clone().transpose())
+                    + bias_t.clone())
+                .reshape([img_h, img_w, 3]);
+                let alpha_col = pred_image.clone().slice(s![.., .., 3..4]);
+                (Tensor::cat(vec![adj_rgb, alpha_col], 2), Some((mat_t, bias_t)))
+            } else {
+                (pred_image.clone(), None)
+            };
+
+            // RGB loss is `(1 - w) * L1 + (-w) * SSIM` per pixel.
             let (l1_w, ssim_w) = if self.ssim_enabled {
                 (1.0 - self.config.ssim_weight, -self.config.ssim_weight)
             } else {
                 (1.0, 0.0)
             };
-            // Only composite when there's a real alpha channel and a non-zero
-            // bg to mix in; the kernel skips the per-pixel `(1-a)*bg` math
-            // entirely when this is None.
             let composite_bg = (has_alpha && background != glam::Vec3::ZERO).then_some(background);
             let cfg = ImageLossConfig {
                 l1_weight: l1_w,
@@ -398,30 +635,48 @@ impl SplatTrainer {
                     0.0
                 },
             };
-            // The kernel takes the RGBA image as rendered.
-            // `loss` is only reassigned by the LPIPS path below, which is
-            // compiled out on wasm — so `mut` is unused there.
-            #[cfg_attr(target_family = "wasm", allow(unused_mut))]
-            let mut loss = image_loss(pred_image.clone(), gt_packed.clone(), cfg);
+            let mut loss = image_loss(pred_for_loss.clone(), gt_packed.clone(), cfg);
 
-            // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
-            // here costs ~99 MB at 4K, only when LPIPS is enabled.
+            if let Some((ref mat_t, ref bias_t)) = app_handles
+                && self.config.appearance_reg_weight > 0.0
+            {
+                let eye = Tensor::<1>::from_floats(
+                    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    &device,
+                )
+                .reshape([3, 3]);
+                let reg = (mat_t.clone() - eye).powi_scalar(2).mean()
+                    + bias_t.clone().powi_scalar(2).mean();
+                loss = loss + reg * self.config.appearance_reg_weight;
+            }
+
+            if self.config.grad_loss_weight > 0.0 {
+                loss = loss
+                    + image_gradient_loss(
+                        pred_for_loss.clone().slice(s![.., .., 0..3]),
+                        gt_packed.clone(),
+                        composite_bg,
+                    ) * self.config.grad_loss_weight;
+            }
+
             #[cfg(not(target_family = "wasm"))]
-            if let Some(lpips) = &self.lpips {
+            if let Some(lpips) = &self.lpips
+                && self.step_count > self.config.lpips_start_iter
+            {
                 let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
                 let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
                 loss = loss
                     + lpips.lpips(
-                        pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
+                        pred_for_loss.slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
             }
 
-            if let (Some(pred_depth), Some(gt_depth_data)) = (pred_depth, batch.depth)
-                && self.config.depth_loss_weight > 0.0
+            if let Some(ref pd) = pred_depth
+                && let Some(gt_depth_data) = batch.depth
+                && depth_weight > 0.0
             {
                 let gt_depth: Tensor<2> = Tensor::from_data(gt_depth_data, &device.clone().inner());
-                let pred_alpha = pred_image.clone().slice(s![.., .., 3..4]).squeeze_dim::<2>(2);
                 let depth_cfg = DepthLossConfig {
                     huber_delta: self.config.depth_huber_delta,
                     edge_threshold: self.config.depth_edge_threshold,
@@ -429,11 +684,61 @@ impl SplatTrainer {
                 };
                 loss = loss
                     + depth_loss_with_config(
-                        pred_depth,
-                        pred_alpha,
+                        pd.clone(),
+                        pred_alpha.clone(),
                         Tensor::from_inner(gt_depth),
                         depth_cfg,
-                    ) * self.config.depth_loss_weight;
+                    ) * depth_weight;
+            }
+
+            if normal_enabled && let Some(ref pd) = pred_depth {
+                let expected_depth = pd.clone() / pred_alpha.clone().clamp_min(1e-2);
+                let sh0_normals = splat_sh0_camera_normals(
+                    splats.transforms.val(),
+                    camera.position,
+                    camera.rotation.inverse(),
+                    SH_C0,
+                );
+                let normal_input = Splats {
+                    transforms: splats.transforms.clone(),
+                    sh_coeffs: splats.sh_coeffs.clone().map(|_| sh0_normals),
+                    raw_opacities: splats.raw_opacities.clone(),
+                    render_mip: splats.render_mip,
+                    min_scale: splats.min_scale.clone(),
+                };
+                let normal_out = render_splats_with_options(
+                    normal_input,
+                    &camera,
+                    img_size,
+                    glam::Vec3::splat(0.5),
+                    RasterPass::Backward,
+                    false,
+                    false,
+                )
+                .instrument(trace_span!("NormalPass"))
+                .await;
+                let pin = camera.build_pinhole_params(img_size);
+                loss = loss
+                    + normal_consistency_loss(
+                        normal_out.img.slice(s![.., .., 0..3]),
+                        pred_alpha,
+                        expected_depth,
+                        pin.fx,
+                        pin.fy,
+                        pin.cx,
+                        pin.cy,
+                        self.config.depth_edge_threshold,
+                    ) * self.config.normal_loss_weight;
+            }
+
+            if self.config.scale_reg_weight > 0.0 && self.config.lr_scale > 0.0 {
+                loss = loss
+                    + scale_regularization_loss(
+                        splats.transforms.val(),
+                        Tensor::from_inner(visible.clone()),
+                        self.config.scale_max_ratio,
+                        0.25,
+                    ) * self.config.scale_reg_weight;
             }
 
             if self.config.opac_entropy_weight > 0.0 {
@@ -462,6 +767,11 @@ impl SplatTrainer {
             let cam_pose_grad = cam_pose_grad_holder
                 .and_then(|h| h.grad_remove(&mut grads))
                 .map(Tensor::without_autodiff);
+            let appearance_grads = app_handles.and_then(|(mat_t, bias_t)| {
+                let mg = mat_t.grad_remove(&mut grads)?.without_autodiff();
+                let bg = bias_t.grad_remove(&mut grads)?.without_autodiff();
+                Some((mg, bg))
+            });
 
             (
                 grads,
@@ -473,6 +783,7 @@ impl SplatTrainer {
                 max_radius,
                 coeffs_grad_sq,
                 cam_pose_grad,
+                appearance_grads,
             )
         };
 
@@ -587,6 +898,37 @@ impl SplatTrainer {
                     state,
                     &grad_vec,
                     self.config.lr_pose,
+                    self.step_count,
+                    self.config.total_train_iters,
+                );
+            }
+        }
+
+        if let Some((mat_g_t, bias_g_t)) = appearance_grads
+            && appearance_enabled
+        {
+            let mat_g: Vec<f32> = mat_g_t
+                .into_data_async()
+                .await
+                .expect("appearance mat grad readback")
+                .try_into_vec()
+                .expect("f32 appearance mat grad");
+            let bias_g: Vec<f32> = bias_g_t
+                .into_data_async()
+                .await
+                .expect("appearance bias grad readback")
+                .try_into_vec()
+                .expect("f32 appearance bias grad");
+            if mat_g.len() == 9
+                && bias_g.len() == 3
+                && mat_g.iter().chain(bias_g.iter()).all(|v| v.is_finite())
+            {
+                let state = self.view_appearances.entry(view_index).or_default();
+                step_appearance_adam(
+                    state,
+                    &mat_g,
+                    &bias_g,
+                    self.config.lr_appearance,
                     self.step_count,
                     self.config.total_train_iters,
                 );
@@ -1024,4 +1366,73 @@ fn sample_background_color<R: rand::Rng + ?Sized>(
         rng.random_range(-strength..strength),
     );
     (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brush_render::{AlphaMode, camera::Camera, kernels::camera_model::CameraModel};
+
+    #[test]
+    fn cosine_decay_and_coarse_schedule_behave_smoothly() {
+        assert!((cosine_decay_scale(1, 100, 0.1) - 1.0).abs() < 1e-6);
+        assert!((cosine_decay_scale(100, 100, 0.1) - 0.1).abs() < 1e-6);
+        let mid = cosine_decay_scale(50, 100, 0.1);
+        assert!(mid > 0.45 && mid < 0.65, "mid={mid}");
+
+        assert_eq!(coarse_scale_for_step(1, 300, 0.5), Some(0.5));
+        assert_eq!(coarse_scale_for_step(150, 300, 0.5), Some(0.75));
+        assert_eq!(coarse_scale_for_step(250, 300, 0.5), None);
+        assert_eq!(coarse_scale_for_step(301, 300, 0.5), None);
+    }
+
+    #[test]
+    fn downsample_batch_averages_rgb_and_valid_depth_only() {
+        let (h, w) = (8usize, 8usize);
+        let px = i32::from_le_bytes([40, 80, 120, 255]);
+        let mut depth = vec![0.0f32; h * w];
+        // Half pixels in top-left 2x2 block are valid 2.0m, half are invalid 0.0m -> valid avg = 2.0.
+        depth[0] = 2.0;
+        depth[1] = 0.0;
+        depth[w] = 0.0;
+        depth[w + 1] = 2.0;
+        let batch = SceneBatch {
+            img_packed: TensorData::new(vec![px; h * w], [h, w]),
+            has_alpha: false,
+            alpha_mode: AlphaMode::Transparent,
+            camera: Camera::new(
+                glam::Vec3::ZERO,
+                glam::Quat::IDENTITY,
+                0.8,
+                0.8,
+                glam::vec2(0.5, 0.5),
+                CameraModel::Pinhole,
+            ),
+            depth: Some(TensorData::new(depth, [h, w])),
+            view_index: 0,
+        };
+        // Small floor clamps downsample dimensions to >= 64 if >= 64, or min(h, w) on tiny 8x8.
+        let same = downsample_batch(&batch, 0.5);
+        assert_eq!(same.img_size(), [8, 8]);
+
+        // Test at realistic 512x424 size -> ~256x212.
+        let (rh, rw) = (424usize, 512usize);
+        let mut big_depth = vec![0.0f32; rh * rw];
+        big_depth[0] = 3.0;
+        big_depth[1] = 0.0;
+        let big = SceneBatch {
+            img_packed: TensorData::new(vec![px; rh * rw], [rh, rw]),
+            has_alpha: false,
+            alpha_mode: AlphaMode::Transparent,
+            camera: batch.camera,
+            depth: Some(TensorData::new(big_depth, [rh, rw])),
+            view_index: 0,
+        };
+        let half = downsample_batch(&big, 0.5);
+        assert_eq!(half.img_size(), [212, 256]);
+        let down_px = half.img_packed.as_slice::<i32>().unwrap()[0].to_le_bytes();
+        assert_eq!(down_px, [40, 80, 120, 255]);
+        let down_d = half.depth.unwrap().as_slice::<f32>().unwrap()[0];
+        assert!((down_d - 3.0).abs() < 1e-5, "down_d={down_d}");
+    }
 }

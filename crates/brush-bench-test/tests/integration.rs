@@ -665,3 +665,122 @@ async fn pose_refinement_recovers_perturbed_camera_pose() {
         "pose rotation did not converge toward GT: init_ang={init_ang_err:.4}, final_ang={final_ang_err:.4}"
     );
 }
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn appearance_and_normal_consistency_train_cleanly() {
+    use brush_render::bwd::render_splats_with_options;
+    use brush_render::gaussian_splats::RasterPass;
+
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let mut splats = generate_test_splats(&device, 64).with_sh_degree(2).valid();
+    let cam = Camera::new(
+        Vec3::new(0.0, 0.0, 3.0),
+        Quat::IDENTITY,
+        0.8,
+        0.8,
+        glam::vec2(0.5, 0.5),
+        Pinhole,
+    );
+    let gt_out = render_splats_with_options(
+        splats.clone().train(),
+        &cam,
+        glam::uvec2(64, 64),
+        Vec3::ZERO,
+        RasterPass::Backward,
+        true,
+        false,
+    )
+    .await;
+    let gt_floats: Vec<f32> = gt_out
+        .img
+        .inner()
+        .into_data_async()
+        .await
+        .expect("gt render readback")
+        .try_into_vec()
+        .expect("f32 gt image");
+    let gt_alpha: Vec<f32> = gt_floats.chunks_exact(4).map(|px| px[3]).collect();
+    let gt_depth_raw: Vec<f32> = gt_out
+        .depth
+        .expect("gt depth")
+        .inner()
+        .into_data_async()
+        .await
+        .expect("gt depth readback")
+        .try_into_vec()
+        .expect("f32 gt depth");
+    let gt_depth: Vec<f32> = gt_depth_raw
+        .into_iter()
+        .zip(gt_alpha)
+        .map(|(d, a)| if a > 0.05 { (d / a).max(0.0) } else { 0.0 })
+        .collect();
+    // Darken view RGB by 0.65x to simulate auto-exposure shift.
+    let packed: Vec<i32> = gt_floats
+        .chunks_exact(4)
+        .map(|px| {
+            let r = ((px[0] * 0.65).clamp(0.0, 1.0) * 255.0).round() as u32;
+            let g = ((px[1] * 0.65).clamp(0.0, 1.0) * 255.0).round() as u32;
+            let b = ((px[2] * 0.65).clamp(0.0, 1.0) * 255.0).round() as u32;
+            (r | (g << 8) | (b << 16) | (255 << 24)) as i32
+        })
+        .collect();
+
+    let batch = SceneBatch {
+        img_packed: TensorData::new(packed, [64usize, 64]),
+        has_alpha: false,
+        alpha_mode: AlphaMode::Transparent,
+        camera: cam,
+        depth: Some(TensorData::new(gt_depth, [64usize, 64])),
+        view_index: 9,
+    };
+
+    let config = TrainConfig {
+        background_noise_strength: 0.0,
+        mean_noise_weight: 0.0,
+        lr_pose: 0.0,
+        lr_appearance: 4e-3,
+        appearance_reg_weight: 0.0,
+        normal_loss_weight: 0.05,
+        scale_reg_weight: 0.01,
+        grad_loss_weight: 0.05,
+        sh_warmup_every: 5,
+        total_train_iters: 40,
+        ..TrainConfig::default()
+    };
+    let mut trainer = SplatTrainer::new(
+        &config,
+        &device,
+        BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
+    );
+
+    let mut first_loss = None;
+    let mut last_loss = 0.0f32;
+    for _ in 0..20 {
+        let (new_splats, stats) = trainer.step(batch.clone(), splats.train()).await;
+        let l = stats
+            .loss
+            .into_scalar_async::<f32>()
+            .await
+            .expect("loss readback");
+        assert!(l.is_finite(), "non-finite loss {l}");
+        if first_loss.is_none() {
+            first_loss = Some(l);
+        }
+        last_loss = l;
+        splats = new_splats.valid();
+    }
+    assert!(
+        last_loss < first_loss.unwrap(),
+        "loss did not decrease: {} -> {last_loss}",
+        first_loss.unwrap()
+    );
+    let (mat, _bias) = trainer
+        .view_appearance(9)
+        .expect("appearance state recorded for view 9");
+    let diag_mean = (mat[0] + mat[4] + mat[8]) / 3.0;
+    assert!(
+        diag_mean < 0.98,
+        "expected affine appearance diagonal to dim below 1.0, got {diag_mean:.4}"
+    );
+}

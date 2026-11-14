@@ -106,6 +106,10 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.1")]
     pub depth_loss_weight: f32,
 
+    /// Cosine-decay multiplier reached by `depth_loss_weight` at `total_train_iters` (1.0 keeps constant).
+    #[arg(long, help_heading = "Training options", default_value = "0.1")]
+    pub depth_loss_min_scale: f32,
+
     /// Huber transition delta (metres) for depth loss; 0 uses pure L1.
     #[arg(long, help_heading = "Training options", default_value = "0.05")]
     pub depth_huber_delta: f32,
@@ -118,6 +122,26 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "false")]
     pub no_depth_range_weight: bool,
 
+    /// Weight of surface-normal consistency loss aligning splat +Z normals with rendered depth normals.
+    #[arg(long, help_heading = "Refine options", default_value = "0.05")]
+    pub normal_loss_weight: f32,
+
+    /// Also run surface-normal consistency on RGB-only views without ground-truth depth.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub normal_loss_rgb: bool,
+
+    /// Weight of splat flatness and max-anisotropy regularization; 0 disables.
+    #[arg(long, help_heading = "Refine options", default_value = "0.01")]
+    pub scale_reg_weight: f32,
+
+    /// Maximum allowed ratio between a splat's largest and middle axis before anisotropy penalty applies.
+    #[arg(long, help_heading = "Refine options", default_value = "10.0")]
+    pub scale_max_ratio: f32,
+
+    /// Weight of high-frequency finite-difference image gradient L1 loss; 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.05")]
+    pub grad_loss_weight: f32,
+
     /// Weight of binary-opacity entropy regularization pushing splats toward 0 or 1 opacity.
     #[arg(long, help_heading = "Refine options", default_value = "0.0001")]
     pub opac_entropy_weight: f32,
@@ -126,8 +150,32 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "1e-4")]
     pub lr_pose: f64,
 
+    /// Learning rate for per-view 3x3 affine appearance correction; 0 disables appearance optimization.
+    #[arg(long, help_heading = "Refine options", default_value = "5e-4")]
+    pub lr_appearance: f64,
+
+    /// L2 regularization pulling per-view affine appearance toward identity.
+    #[arg(long, help_heading = "Refine options", default_value = "0.01")]
+    pub appearance_reg_weight: f32,
+
+    /// Iterations per unlocked SH degree band during warmup; 0 unlocks all bands immediately.
+    #[arg(long, help_heading = "Training options", default_value = "1000")]
+    pub sh_warmup_every: u32,
+
+    /// Iterations for coarse-to-fine image resolution warmup (>= 256px views only); 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "3000")]
+    pub coarse_warmup_iters: u32,
+
+    /// Starting resolution scale factor during coarse-to-fine warmup (in (0.1, 1.0]).
+    #[arg(long, help_heading = "Training options", default_value = "0.5")]
+    pub coarse_scale_start: f32,
+
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
+
+    /// Iteration after which LPIPS loss activates when `lpips_loss_weight > 0` (0 starts immediately).
+    #[arg(long, help_heading = "Refine options", default_value = "15000")]
+    pub lpips_start_iter: u32,
 
     /// Base background color (R,G,B) used during training.
     #[arg(

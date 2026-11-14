@@ -1,7 +1,5 @@
-use crate::shaders;
-
 use glam::Vec3;
-const SH_C0: f32 = shaders::SH_C0;
+pub use crate::shaders::SH_C0;
 
 pub const fn sh_coeffs_for_degree(degree: u32) -> u32 {
     (degree + 1).pow(2)

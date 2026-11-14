@@ -1407,3 +1407,229 @@ pub fn opacity_entropy_loss(raw_opacities: Tensor<1>, active_mask: Tensor<1>) ->
     let count = mask.clone().sum().clamp_min(1.0);
     (entropy * mask).sum() / count
 }
+
+/// Splat flatness & max-anisotropy regularizer over active splats.
+///
+/// Penalizes both needle-like elongation above `max_ratio` (`max_scale / mid_scale`)
+/// and thick spherical splats (`min_scale / mid_scale`), keeping tangent-aligned
+/// splats thin and sheet-like without turning them into spikes.
+pub fn scale_regularization_loss(
+    transforms: Tensor<2>,
+    active_mask: Tensor<1>,
+    max_ratio: f32,
+    flatness_weight: f32,
+) -> Tensor<1> {
+    let log_scales = transforms.slice(s![.., 7..10]);
+    let scales = log_scales.clamp(-12.0, 4.0).exp();
+    let s_max = scales.clone().max_dim(1).squeeze_dim::<1>(1);
+    let s_min = scales.clone().min_dim(1).squeeze_dim::<1>(1);
+    let s_mid = (scales.sum_dim(1).squeeze_dim::<1>(1) - s_max.clone() - s_min.clone())
+        .clamp_min(1e-6);
+
+    let ratio = s_max / s_mid.clone();
+    let aniso = (ratio - max_ratio.max(1.0)).clamp_min(0.0);
+    let flatness = (s_min / s_mid).mul_scalar(flatness_weight.max(0.0));
+
+    let mask = active_mask.detach();
+    let count = mask.clone().sum().clamp_min(1.0);
+    ((aniso + flatness) * mask).sum() / count
+}
+
+/// Compute differentiable SH-degree-0 coefficients `[N, 1, 3]` encoding each
+/// splat's camera-facing local `+Z` surface normal as `(n_cam + 1) * 0.5`.
+pub fn splat_sh0_camera_normals(
+    transforms: Tensor<2>,
+    cam_pos: Vec3,
+    world_to_cam: glam::Quat,
+    sh_c0: f32,
+) -> Tensor<3> {
+    let device = transforms.device();
+    let means = transforms.clone().slice(s![.., 0..3]);
+    let quats = transforms.slice(s![.., 3..7]);
+    let q_norm = quats.clone()
+        / quats
+            .powi_scalar(2)
+            .sum_dim(1)
+            .add_scalar(1e-12)
+            .sqrt();
+
+    let qw = q_norm.clone().slice(s![.., 0..1]);
+    let qx = q_norm.clone().slice(s![.., 1..2]);
+    let qy = q_norm.clone().slice(s![.., 2..3]);
+    let qz = q_norm.slice(s![.., 3..4]);
+
+    // Column 2 (+Z axis) of rotation matrix from unit quaternion [w, x, y, z].
+    let nx = (qx.clone() * qz.clone() + qw.clone() * qy.clone()).mul_scalar(2.0);
+    let ny = (qy.clone() * qz - qw * qx.clone()).mul_scalar(2.0);
+    let nz = (qx.powi_scalar(2) + qy.powi_scalar(2))
+        .mul_scalar(-2.0)
+        .add_scalar(1.0);
+    let n_world = Tensor::cat(vec![nx, ny, nz], 1);
+
+    let cam_t = Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device)
+        .reshape([1, 3]);
+    let view_dir = cam_t - means;
+    let dot = (n_world.clone() * view_dir).sum_dim(1);
+    let flip = (dot.greater_equal_elem(0.0).float().mul_scalar(2.0) - 1.0).detach();
+    let n_facing = n_world * flip;
+
+    // `n_facing` is [N, 3] row vectors; right-multiply by transpose of `Mat3::from_quat(world_to_cam)`.
+    let r = glam::Mat3::from_quat(world_to_cam);
+    let r_t = Tensor::<1>::from_floats(
+        [
+            r.x_axis.x, r.y_axis.x, r.z_axis.x,
+            r.x_axis.y, r.y_axis.y, r.z_axis.y,
+            r.x_axis.z, r.y_axis.z, r.z_axis.z,
+        ],
+        &device,
+    )
+    .reshape([3, 3]);
+    let n_cam = n_facing.matmul(r_t);
+    n_cam.mul_scalar(0.5 / sh_c0).unsqueeze_dim::<3>(1)
+}
+
+/// Camera-space unit normals `[H-1, W-1, 3]` (pointing toward `-Z`) derived
+/// via finite differences of expected depth `[H, W]`.
+pub fn depth_normals_from_depth(
+    expected_depth: Tensor<2>,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+) -> Tensor<3> {
+    let [h, w] = expected_depth.dims();
+    let device = expected_depth.device();
+    let u = Tensor::<1, Int>::arange(0..(w as i64), &device)
+        .float()
+        .add_scalar(0.5 - cx)
+        .div_scalar(fx.max(1e-6))
+        .reshape([1, w]);
+    let v = Tensor::<1, Int>::arange(0..(h as i64), &device)
+        .float()
+        .add_scalar(0.5 - cy)
+        .div_scalar(fy.max(1e-6))
+        .reshape([h, 1]);
+
+    let px = (expected_depth.clone() * u).unsqueeze_dim::<3>(2);
+    let py = (expected_depth.clone() * v).unsqueeze_dim::<3>(2);
+    let pz = expected_depth.unsqueeze_dim::<3>(2);
+    let pts = Tensor::cat(vec![px, py, pz], 2);
+
+    // Scale finite differences by `fx` so `|dy × dx| ~ O(z^2) ~ 1` at any focal
+    // length/resolution instead of squaring `1/fx` into `1e-14` where `1e-12` biases `f32`.
+    let scale = fx.max(1.0);
+    let dx = (pts.clone().slice(s![0..(h - 1), 1..w, 0..3])
+        - pts.clone().slice(s![0..(h - 1), 0..(w - 1), 0..3]))
+        .mul_scalar(scale);
+    let dy = (pts.clone().slice(s![1..h, 0..(w - 1), 0..3])
+        - pts.slice(s![0..(h - 1), 0..(w - 1), 0..3]))
+        .mul_scalar(scale);
+
+    // `dy × dx` points toward `-Z` in OpenCV (+X right, +Y down, +Z forward).
+    let dxx = dx.clone().slice(s![.., .., 0..1]);
+    let dxy = dx.clone().slice(s![.., .., 1..2]);
+    let dxz = dx.slice(s![.., .., 2..3]);
+
+    let dyx = dy.clone().slice(s![.., .., 0..1]);
+    let dyy = dy.clone().slice(s![.., .., 1..2]);
+    let dyz = dy.slice(s![.., .., 2..3]);
+
+    let nx = dyy.clone() * dxz.clone() - dyz.clone() * dxy.clone();
+    let ny = dyz * dxx.clone() - dyx.clone() * dxz;
+    let nz = dyx * dxy - dyy * dxx;
+    let n = Tensor::cat(vec![nx, ny, nz], 2);
+    let norm = n
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .add_scalar(1e-12)
+        .sqrt();
+    n / norm
+}
+
+/// Surface-normal consistency loss `mean(1 - dot(n_splat, n_depth))` over
+/// opaque, locally smooth depth pixels `[H-1, W-1]`.
+#[allow(clippy::too_many_arguments)]
+pub fn normal_consistency_loss(
+    pred_normal_rgb: Tensor<3>,
+    pred_alpha: Tensor<2>,
+    expected_depth: Tensor<2>,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    edge_threshold: f32,
+) -> Tensor<1> {
+    let [h, w, _] = pred_normal_rgb.dims();
+    if h < 2 || w < 2 {
+        return Tensor::zeros([1], &pred_normal_rgb.device());
+    }
+
+    let n_depth = depth_normals_from_depth(expected_depth.clone(), fx, fy, cx, cy);
+    let raw_n = pred_normal_rgb
+        .slice(s![0..(h - 1), 0..(w - 1), 0..3])
+        .mul_scalar(2.0)
+        .sub_scalar(1.0);
+    let n_splat = raw_n.clone()
+        / raw_n
+            .powi_scalar(2)
+            .sum_dim(2)
+            .add_scalar(1e-12)
+            .sqrt();
+
+    let alpha_valid = pred_alpha
+        .slice(s![0..(h - 1), 0..(w - 1)])
+        .greater_elem(0.5)
+        .float();
+    let depth_valid = expected_depth
+        .clone()
+        .slice(s![0..(h - 1), 0..(w - 1)])
+        .greater_elem(0.05)
+        .float();
+    let mut weights = alpha_valid * depth_valid;
+
+    if edge_threshold > 0.0 {
+        let d_base = expected_depth
+            .clone()
+            .slice(s![0..(h - 1), 0..(w - 1)])
+            .clamp_min(1e-3);
+        let dz_x = (expected_depth.clone().slice(s![0..(h - 1), 1..w]) - d_base.clone()).abs()
+            / d_base.clone();
+        let dz_y = (expected_depth.slice(s![1..h, 0..(w - 1)]) - d_base.clone()).abs() / d_base;
+        let rel_sq = (dz_x.powi_scalar(2) + dz_y.powi_scalar(2))
+            .mul_scalar(1.0 / (edge_threshold * edge_threshold))
+            .detach();
+        weights = weights * (rel_sq + 1.0).recip();
+    }
+
+    let cos_sim = (n_splat * n_depth).sum_dim(2).squeeze_dim::<2>(2);
+    let align_err: Tensor<2> = (1.0f32 - cos_sim).clamp_min(0.0);
+    let denom = weights.clone().sum().clamp_min(1.0);
+    (align_err * weights).sum() / denom
+}
+
+/// High-frequency horizontal and vertical gradient L1 loss between `pred_rgb`
+/// (`[H, W, 3]`) and packed GT RGBA (`[H, W]`).
+pub fn image_gradient_loss(
+    pred_rgb: Tensor<3>,
+    gt_packed: Tensor<2, Int>,
+    composite_bg: Option<Vec3>,
+) -> Tensor<1> {
+    let [h, w, _] = pred_rgb.dims();
+    if h < 2 || w < 2 {
+        return Tensor::zeros([1], &pred_rgb.device());
+    }
+    let gt_rgb: Tensor<3> = Tensor::from_inner(unpack_gt_rgb(gt_packed, composite_bg));
+
+    let pred_dx = pred_rgb.clone().slice(s![.., 1..w, 0..3])
+        - pred_rgb.clone().slice(s![.., 0..(w - 1), 0..3]);
+    let gt_dx = gt_rgb.clone().slice(s![.., 1..w, 0..3])
+        - gt_rgb.clone().slice(s![.., 0..(w - 1), 0..3]);
+
+    let pred_dy = pred_rgb.clone().slice(s![1..h, .., 0..3])
+        - pred_rgb.slice(s![0..(h - 1), .., 0..3]);
+    let gt_dy = gt_rgb.clone().slice(s![1..h, .., 0..3])
+        - gt_rgb.slice(s![0..(h - 1), .., 0..3]);
+
+    (pred_dx - gt_dx).abs().mean() + (pred_dy - gt_dy).abs().mean()
+}

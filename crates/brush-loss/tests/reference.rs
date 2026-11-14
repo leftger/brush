@@ -411,3 +411,145 @@ async fn opacity_entropy_loss_peaks_at_half_and_vanishes_at_extremes() {
     assert!(g[2].abs() < 1e-6);
     assert!(g[0].abs() < 1e-5);
 }
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn scale_reg_penalizes_elongated_and_thick_splats() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // Splat 0: well-behaved thin disk (0.1, 0.1, 0.01) -> aniso 0, flatness 0.1
+    // Splat 1: needle (0.8, 0.04, 0.04) -> aniso 20-10 = 10, flatness 1.0
+    let mut raw = vec![0.0f32; 2 * 10];
+    raw[7..10].copy_from_slice(&[0.1f32.ln(), 0.1f32.ln(), 0.01f32.ln()]);
+    raw[17..20].copy_from_slice(&[0.8f32.ln(), 0.04f32.ln(), 0.04f32.ln()]);
+    let transforms = Tensor::<1>::from_floats(raw.as_slice(), &device)
+        .reshape([2, 10])
+        .require_grad();
+    let active_disk = Tensor::<1>::from_floats([1.0, 0.0], &device);
+    let active_needle = Tensor::<1>::from_floats([0.0, 1.0], &device);
+
+    let l_disk = brush_loss::scale_regularization_loss(transforms.clone(), active_disk, 10.0, 0.5)
+        .into_scalar_async::<f32>()
+        .await
+        .expect("readback");
+    let l_needle =
+        brush_loss::scale_regularization_loss(transforms.clone(), active_needle, 10.0, 0.5)
+            .into_scalar_async::<f32>()
+            .await
+            .expect("readback");
+    assert!(
+        l_needle > l_disk * 50.0,
+        "needle ({l_needle}) should be penalized much more than thin disk ({l_disk})"
+    );
+    let grads = brush_loss::scale_regularization_loss(
+        transforms.clone(),
+        Tensor::<1>::from_floats([1.0, 1.0], &device),
+        10.0,
+        0.5,
+    )
+    .backward();
+    let g = to_vec(transforms.grad(&grads).expect("transform grad")).await;
+    assert!(g.iter().all(|v| v.is_finite()));
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn normal_consistency_zero_for_fronto_parallel_and_positive_for_tilted() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // Constant depth z=2.0 -> depth normals are (0, 0, -1), encoded RGB = (0.5, 0.5, 0.0).
+    let depth = Tensor::<1>::from_floats([2.0f32; 16], &device).reshape([4, 4]);
+    let alpha = Tensor::<1>::from_floats([1.0f32; 16], &device).reshape([4, 4]);
+
+    let aligned_rgb: Vec<f32> = (0..16).flat_map(|_| [0.5f32, 0.5, 0.0]).collect();
+    let tilted_rgb: Vec<f32> = (0..16).flat_map(|_| [1.0f32, 0.5, 0.5]).collect();
+    let pred_aligned = Tensor::<1>::from_floats(aligned_rgb.as_slice(), &device)
+        .reshape([4, 4, 3])
+        .require_grad();
+    let pred_tilted = Tensor::<1>::from_floats(tilted_rgb.as_slice(), &device)
+        .reshape([4, 4, 3])
+        .require_grad();
+
+    let l_aligned = brush_loss::normal_consistency_loss(
+        pred_aligned,
+        alpha.clone(),
+        depth.clone(),
+        300.0,
+        300.0,
+        2.0,
+        2.0,
+        0.05,
+    )
+    .into_scalar_async::<f32>()
+    .await
+    .expect("readback");
+    let loss_tilted = brush_loss::normal_consistency_loss(
+        pred_tilted.clone(),
+        alpha,
+        depth,
+        300.0,
+        300.0,
+        2.0,
+        2.0,
+        0.05,
+    );
+    let l_tilted = loss_tilted
+        .clone()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("readback");
+    assert!(l_aligned < 1e-4, "expected ~0 aligned normal loss, got {l_aligned}");
+    assert!((l_tilted - 1.0).abs() < 1e-3, "expected ~1.0 orthogonal normal loss, got {l_tilted}");
+    let grads = loss_tilted.backward();
+    let g = to_vec(pred_tilted.grad(&grads).expect("normal grad")).await;
+    assert!(g.iter().all(|v| v.is_finite()));
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn splat_sh0_camera_normals_faces_camera_and_differentiates_quat() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // Identity quat -> local +Z = (0, 0, +1). Camera at (0, 0, -2) sees view_dir = (0, 0, -2),
+    // so facing normal flips to (0, 0, -1). Identity camera rotation leaves n_cam = (0, 0, -1).
+    let transforms = Tensor::<1>::from_floats([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -3.0, -3.0, -3.0], &device)
+        .reshape([1, 10])
+        .require_grad();
+    let sh0 = brush_loss::splat_sh0_camera_normals(
+        transforms.clone(),
+        glam::Vec3::new(0.0, 0.0, -2.0),
+        glam::Quat::IDENTITY,
+        0.282_094_8,
+    );
+    let vals = to_vec(sh0.clone()).await;
+    // Rendered color = sh0 * SH_C0 + 0.5 -> expect (0.5, 0.5, 0.0) so sh0.z = -0.5 / SH_C0.
+    assert!(vals[0].abs() < 1e-5 && vals[1].abs() < 1e-5);
+    assert!((vals[2] * 0.282_094_8 + 0.5).abs() < 1e-5, "vals={vals:?}");
+    let grads = sh0.powi_scalar(2).sum().backward();
+    let g = to_vec(transforms.grad(&grads).expect("quat grad")).await;
+    assert!(g.iter().all(|v| v.is_finite()));
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn image_gradient_loss_tracks_edges() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // Left half black, right half white in GT.
+    let black = 255u32 << 24;
+    let white = 0xff_ff_ff_ffu32;
+    let packed = Tensor::<1, burn::tensor::Int>::from_ints(
+        [black as i32, white as i32, black as i32, white as i32],
+        &device.clone().inner(),
+    )
+    .reshape([2, 2]);
+    let flat_pred = Tensor::<1>::from_floats([0.5; 12], &device)
+        .reshape([2, 2, 3])
+        .require_grad();
+    let loss = brush_loss::image_gradient_loss(flat_pred.clone(), packed, None);
+    let l = loss
+        .clone()
+        .into_scalar_async::<f32>()
+        .await
+        .expect("readback");
+    assert!(l > 0.5, "expected positive edge gradient loss, got {l}");
+    let grads = loss.backward();
+    let g = to_vec(flat_pred.grad(&grads).expect("rgb grad")).await;
+    assert!(g.iter().all(|v| v.is_finite()));
+}
