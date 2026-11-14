@@ -215,18 +215,57 @@ fn compute_knn_scales(pos_data: &[f32]) -> Vec<f32> {
     })
 }
 
+const DISK_THICKNESS_RATIO: f32 = 0.15;
+
+fn rotations_from_normals(normals: &[f32]) -> Vec<f32> {
+    normals
+        .chunks_exact(3)
+        .flat_map(|n| {
+            let v = Vec3::new(n[0], n[1], n[2]);
+            let len = v.length();
+            let q = if len.is_finite() && len > 1e-6 {
+                glam::Quat::from_rotation_arc(Vec3::Z, v / len)
+            } else {
+                glam::Quat::IDENTITY
+            };
+            [q.w, q.x, q.y, q.z]
+        })
+        .collect()
+}
+
+fn flatten_normal_axis_scales(log_scales: &mut [f32]) {
+    let min_log = (1e-4_f32).ln();
+    let ratio_log = DISK_THICKNESS_RATIO.ln();
+    for s in log_scales.chunks_exact_mut(3) {
+        s[2] = (s[2] + ratio_log).max(min_log);
+    }
+}
+
 pub fn to_init_splats(data: SplatData, mode: SplatRenderMode, device: &Device) -> Splats {
     let n_splats = data.num_splats();
 
-    // Use KNN for scales if not provided
-    let log_scales = data
-        .log_scales
-        .unwrap_or_else(|| compute_knn_scales(&data.means));
+    let normals = data
+        .normals
+        .as_deref()
+        .filter(|n| n.len() == n_splats * 3);
 
-    // Default rotation = identity quaternion [1, 0, 0, 0]
-    let rotations = data
-        .rotations
-        .unwrap_or_else(|| [1.0, 0.0, 0.0, 0.0].repeat(n_splats));
+    // Use KNN for scales if not provided, flattening the local +Z axis when
+    // surface normals align the splat into a tangent disk.
+    let log_scales = data.log_scales.unwrap_or_else(|| {
+        let mut scales = compute_knn_scales(&data.means);
+        if normals.is_some() && data.rotations.is_none() {
+            flatten_normal_axis_scales(&mut scales);
+        }
+        scales
+    });
+
+    // Align local +Z with vertex normals when provided; otherwise identity [w,x,y,z].
+    let rotations = data.rotations.unwrap_or_else(|| {
+        normals.map_or_else(
+            || [1.0, 0.0, 0.0, 0.0].repeat(n_splats),
+            rotations_from_normals,
+        )
+    });
 
     // Default opacity = inverse_sigmoid(0.5)
     let opacities = data
@@ -291,5 +330,40 @@ mod tests {
         // reasonable.
         assert!(bb.center.is_finite());
         assert!(bb.extent.is_finite());
+    }
+
+    #[test]
+    fn normals_align_local_z_to_surface_and_flatten_normal_scale() {
+        let normals = [
+            0.0_f32, 0.0, 1.0, // +Z -> identity
+            0.0, 0.0, -1.0, // -Z -> 180 deg flip
+            2.0, -4.0, 4.0, // non-unit diagonal
+            0.0, 0.0, 0.0, // degenerate -> identity
+        ];
+        let rots = rotations_from_normals(&normals);
+        assert_eq!(rots.len(), 16);
+
+        let check_dir = |chunk: &[f32], expected: Vec3| {
+            let q = glam::Quat::from_xyzw(chunk[1], chunk[2], chunk[3], chunk[0]);
+            assert!((q.length() - 1.0).abs() < 1e-5);
+            let mapped = q * Vec3::Z;
+            assert!(
+                (mapped - expected).length() < 1e-5,
+                "expected {expected:?}, got {mapped:?}"
+            );
+        };
+        check_dir(&rots[0..4], Vec3::Z);
+        check_dir(&rots[4..8], Vec3::NEG_Z);
+        check_dir(&rots[8..12], Vec3::new(2.0, -4.0, 4.0).normalize());
+        check_dir(&rots[12..16], Vec3::Z);
+
+        let mut scales = vec![-2.0_f32; 6];
+        flatten_normal_axis_scales(&mut scales);
+        assert_eq!(scales[0], -2.0);
+        assert_eq!(scales[1], -2.0);
+        assert!(scales[2] < -3.8);
+        assert_eq!(scales[3], -2.0);
+        assert_eq!(scales[4], -2.0);
+        assert!(scales[5] < -3.8);
     }
 }

@@ -33,6 +33,7 @@ pub struct SplatData {
     pub log_scales: Option<Vec<f32>>,
     pub sh_coeffs: Option<Vec<f32>>,
     pub raw_opacities: Option<Vec<f32>>,
+    pub normals: Option<Vec<f32>>,
 }
 
 impl SplatData {
@@ -70,6 +71,7 @@ impl SplatData {
             log_scales: self.log_scales.as_deref().map(|v| pick(v, 3)),
             sh_coeffs: self.sh_coeffs.as_deref().map(|v| pick(v, sh_stride)),
             raw_opacities: self.raw_opacities.as_deref().map(|v| pick(v, 1)),
+            normals: self.normals.as_deref().map(|v| pick(v, 3)),
         }
     }
 
@@ -324,6 +326,9 @@ async fn parse_ply<T: AsyncRead + Unpin>(
         })
         .count();
 
+    let has_normals =
+        vertex.has_property("nx") && vertex.has_property("ny") && vertex.has_property("nz");
+
     let mut data = SplatData {
         means: vec_exact(max_splats * 3),
         rotations: vertex
@@ -336,6 +341,7 @@ async fn parse_ply<T: AsyncRead + Unpin>(
         raw_opacities: vertex
             .has_property("opacity")
             .then(|| vec_exact(max_splats)),
+        normals: has_normals.then(|| vec_exact(max_splats * 3)),
     };
 
     let mut row_index: usize = 0;
@@ -377,6 +383,13 @@ async fn parse_ply<T: AsyncRead + Unpin>(
             }
             if let Some(opacity) = &mut data.raw_opacities {
                 opacity.push(gauss.opacity);
+            }
+            if let Some(normals) = &mut data.normals {
+                normals.extend([
+                    gauss.nx.unwrap_or(0.0),
+                    gauss.ny.unwrap_or(0.0),
+                    gauss.nz.unwrap_or(0.0),
+                ]);
             }
         })
         .deserialize(&mut *file)?;
@@ -541,6 +554,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
                 log_scales: Some(log_scales.clone()),
                 sh_coeffs: Some(sh_coeffs.clone()),
                 raw_opacities: Some(opacity.clone()),
+                normals: None,
             };
             emitter.emit(SplatMessage { meta, data }).await;
         }
@@ -590,6 +604,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
             log_scales: Some(log_scales),
             sh_coeffs: Some(total_coeffs),
             raw_opacities: Some(opacity),
+            normals: None,
         };
         emitter.emit(SplatMessage { meta, data }).await;
     }
@@ -679,6 +694,7 @@ mod tests {
             log_scales: Some(make(3)),
             sh_coeffs: Some(make(6)),
             raw_opacities: Some(make(1)),
+            normals: Some(make(3)),
         };
 
         // Within budget: untouched.
@@ -724,5 +740,36 @@ mod tests {
         assert!((imported_up.x - custom_up.x).abs() < 1e-5);
         assert!((imported_up.y - custom_up.y).abs() < 1e-5);
         assert!((imported_up.z - custom_up.z).abs() < 1e-5);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_import_point_cloud_with_normals_populates_normals() {
+        let mut ply = b"ply\nformat binary_little_endian 1.0\n\
+            element vertex 2\n\
+            property float x\nproperty float y\nproperty float z\n\
+            property uchar red\nproperty uchar green\nproperty uchar blue\n\
+            property float nx\nproperty float ny\nproperty float nz\n\
+            end_header\n"
+            .to_vec();
+        for (p, c, n) in [
+            ([1.0f32, 2.0, 3.0], [255u8, 0, 0], [0.0f32, 1.0, 0.0]),
+            ([4.0f32, 5.0, 6.0], [0u8, 255, 0], [0.0f32, 0.0, -1.0]),
+        ] {
+            for v in p {
+                ply.extend_from_slice(&v.to_le_bytes());
+            }
+            ply.extend_from_slice(&c);
+            for v in n {
+                ply.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let msg = load_splat_from_ply(Cursor::new(ply), None).await.unwrap();
+        assert_eq!(msg.data.num_splats(), 2);
+        assert!(msg.data.rotations.is_none());
+        assert!(msg.data.log_scales.is_none());
+        assert_eq!(
+            msg.data.normals.unwrap(),
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, -1.0]
+        );
     }
 }

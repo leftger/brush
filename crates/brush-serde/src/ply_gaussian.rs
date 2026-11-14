@@ -97,6 +97,14 @@ pub struct PlyGaussian {
     pub(crate) green: Option<f32>,
     #[serde(default, alias = "b", skip_serializing, deserialize_with = "de_quant")]
     pub(crate) blue: Option<f32>,
+
+    // Optional surface normals for oriented disk initialization.
+    #[serde(default, skip_serializing)]
+    pub(crate) nx: Option<f32>,
+    #[serde(default, skip_serializing)]
+    pub(crate) ny: Option<f32>,
+    #[serde(default, skip_serializing)]
+    pub(crate) nz: Option<f32>,
 }
 
 // Generate the sh_rest_coeffs() method using proc macro
